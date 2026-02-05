@@ -1455,6 +1455,6 @@ Jira Story (INC02-42) →
 
 | Versão | Data | Autor | Mudanças |
 |--------|------|-------|----------|
-| 1.0 | 05/02/2026 | Claudecir Miranda | Versão inicial aprovada |
+| 1.0 | 05/02/2026 | Claudecir Miranda | Versão inicial |
 
 ---

@@ -1,3 +1,19 @@
+# Documentação Arquitetural – Solução Mobile de Autoatendimento Postal
+
+## Sumário
+1. [Visão Geral da Arquitetura](#1-visão-geral-da-arquitetura)
+2. [Diagramas C4](#2-diagramas-c4)
+3. [Diagramas de Comportamento](#3-diagramas-de-comportamento)
+4. [Decisões Arquiteturais (ADRs)](#4-decisões-arquiteturais-adrs)
+5. [Requisitos Não Funcionais Derivados](#5-requisitos-não-funcionais-derivados)
+6. [Análise Técnica e Decisão de Stack](#6-análise-técnica-e-decisão-de-stack)
+7. [Dataset Estruturado de Decisão Arquitetural](#7-dataset-estruturado-de-decisão-arquitetural)
+8. [Roadmap de Evolução Arquitetural](#8-roadmap-de-evolução-arquitetural)
+9. [Conformidade e Governança](#9-conformidade-e-governança)
+10. [Anexos](#anexos)
+
+---
+
 # 1. Visão Geral da Arquitetura
 
 ## Resumo Executivo
@@ -2042,3 +2058,2205 @@ Esta seção documenta Architecture Decision Records (ADRs) para decisões estru
 - Consent Management Service com DynamoDB (append-only log)
 - Auditoria completa de opt-in/opt-out
 - Integração com sistemas de marketing para bloqueio automático
+
+# 5. Requisitos Não Funcionais Derivados
+
+## Introdução
+
+Esta seção identifica requisitos técnicos derivados da arquitetura, organizados por categorias de qualidade (ISO/IEC 25010). Os requisitos capturam expectativas quantificáveis de performance, disponibilidade, segurança, observabilidade, manutenibilidade e governança, com rastreabilidade para incrementos e decisões arquiteturais.
+
+---
+
+## 5.1. Performance e Escalabilidade
+
+### Throughput Esperado
+
+| Métrica | MVP (12 meses) | Ano 2 | Ano 3 | Pico Sazonal |
+|---------|----------------|-------|-------|--------------|
+| Usuários Ativos Mensais (MAU) | 10K | 100K | 500K | 3x médio |
+| Transações/mês | 50K | 500K | 3M | 9M |
+| Requisições API/segundo (média) | 5 | 50 | 250 | 750 |
+| Requisições API/segundo (pico) | 20 | 200 | 1000 | 3000 |
+| Eventos rastreamento/segundo | 10 | 100 | 500 | 1500 |
+| Push notifications/segundo | 5 | 50 | 250 | 750 |
+
+### Latência Aceitável
+
+| Operação | Target p50 | Target p95 | Target p99 | Restrição Organizacional |
+|----------|------------|------------|------------|--------------------------|
+| GET /v1/profiles (cache hit) | 50ms | 100ms | 200ms | - |
+| GET /v1/profiles (cache miss) | 150ms | 300ms | 500ms | - |
+| POST /v1/shipping/quote | 500ms | 1500ms | 3000ms | Correios API p95: 3-5s |
+| POST /v1/shipping/purchase (Saga completa) | 2s | 5s | 10s | Payment Gateway p95: 2s |
+| GET /v1/tracking/{code} (cache hit) | 50ms | 100ms | 200ms | - |
+| GET /v1/tracking/{code} (cache miss + polling) | 1s | 3s | 5s | Legacy Systems p95: 3-5s |
+| Webhook → Push Notification (E2E) | 1s | 3s | 5s | APNS/FCM p95: 1-2s |
+| POST /v1/auth/register | 300ms | 800ms | 1500ms | - |
+| Mobile app startup (offline) | 500ms | 1000ms | 2000ms | - |
+| Mobile app sync (100 operações pendentes) | 5s | 15s | 30s | - |
+
+### Estratégia de Escalabilidade Horizontal
+
+**Backend Microservices (ECS Fargate):**
+- **Auto-scaling triggers:**
+  - CPU > 70% por 2min → scale out (+1 task)
+  - CPU < 30% por 10min → scale in (-1 task)
+  - Memória > 80% por 2min → scale out
+- **Limites:**
+  - Min tasks: 2 (High Availability)
+  - Max tasks: 50 (MVP), 200 (Ano 2), 500 (Ano 3)
+- **Target tracking:** 60% CPU utilization
+
+**API Gateway:**
+- **Throttling:**
+  - Rate limit per user: 100 req/min (burst 200)
+  - Rate limit global: 10K req/min (MVP), 100K (Ano 2)
+- **Auto-scaling:** Gerenciado automaticamente por AWS
+
+**Databases (RDS PostgreSQL):**
+- **Read Replicas:**
+  - MVP: 0 (single instance)
+  - Ano 2: 2 read replicas (read-heavy workloads: tracking, profiles)
+  - Ano 3: 3-5 read replicas
+- **Vertical scaling:**
+  - MVP: r5.large (2 vCPU, 16GB RAM)
+  - Ano 2: r5.xlarge (4 vCPU, 32GB RAM)
+  - Ano 3: r5.2xlarge (8 vCPU, 64GB RAM)
+- **Connection pooling:** PgBouncer (max 500 connections)
+
+**Cache (ElastiCache Redis):**
+- **Cluster Mode:**
+  - MVP: Single node (r5.large)
+  - Ano 2: Cluster mode enabled (3 shards, 1 replica cada)
+  - Ano 3: 5 shards, 2 replicas
+- **Eviction policy:** allkeys-lru (Least Recently Used)
+
+**Event Stream (Kinesis Data Streams):**
+- **Sharding:**
+  - MVP: 2 shards (2MB/s write, 4MB/s read)
+  - Ano 2: 10 shards
+  - Ano 3: 50 shards
+- **Auto-scaling:** Enhanced fan-out habilitado
+
+### Pontos de Contenção Identificados
+
+| Componente | Risco de Gargalo | Mitigação |
+|------------|------------------|-----------|
+| API Gateway | Rate limiting pode bloquear clientes legítimos em picos | Monitoramento de throttled requests, ajuste dinâmico de limites |
+| RDS PostgreSQL (writes) | Single master limita throughput de escrita | Considerar Aurora PostgreSQL (multi-master) em Ano 3 |
+| Legacy Systems Integration Hub | Timeout 2s pode gerar falsos positivos | Circuit breaker com fallback para SQS, cache defensivo 24h |
+| Payment Gateway Adapter | Dependência externa (SLA 99.9%) | Retry 3x com backoff, alertas se success rate < 90% |
+| Synchronization Engine (mobile) | Fila local pode crescer indefinidamente offline | Limite de 1000 operações pendentes, FIFO com descarte de antigas |
+
+**Rastreabilidade:**
+- ADR-002 (Microserviços escaláveis)
+- ADR-003 (Carrier Integration com cache)
+- ADR-005 (Rastreamento híbrido)
+- INC01, INC02, INC03, INC04 (todos incrementos impactados)
+
+---
+
+## 5.2. Disponibilidade e Resiliência (RTO/RPO)
+
+### SLA Esperado
+
+| Componente | Tier | SLA Target | Downtime Anual Permitido | Restrição Organizacional |
+|------------|------|------------|--------------------------|--------------------------|
+| API Gateway + Backend Core (Identity, Profile) | Tier 1 | 99.9% | 8.76h/ano | - |
+| Shipping Orchestration + Payment | Tier 1 | 99.9% | 8.76h/ano | PCI-DSS requer alta disponibilidade |
+| Tracking Service | Tier 2 | 99.5% | 43.8h/ano | - |
+| Location Service, Support Adapter | Tier 3 | 99.0% | 87.6h/ano | - |
+| Legacy Systems Integration Hub | Tier 2 | 95.0% (delegado) | 438h/ano | CloudFoundry SLA 95% |
+
+### RTO (Recovery Time Objective) e RPO (Recovery Point Objective)
+
+| Incremento | Criticidade | RTO | RPO | Justificativa |
+|------------|-------------|-----|-----|---------------|
+| INC02 (Transacional - Pagamentos) | Tier 1 | 1 hora | 5 minutos | Dados financeiros críticos, PCI-DSS compliance |
+| INC03 (Rastreamento) | Tier 2 | 4 horas | 15 minutos | Eventos de rastreamento podem ser reprocessados |
+| INC01, INC04 (Informacional) | Tier 3 | 8 horas | 1 hora | Perfis, agências são read-heavy, cache mitigates |
+
+### Estratégias de Mitigação de SPOFs (Single Points of Failure)
+
+**Identificados:**
+
+1. **API Gateway:**
+   - **SPOF:** Ponto de entrada único
+   - **Mitigação:** AWS API Gateway é Multi-AZ nativo, auto-scaling automático, SLA 99.95%
+   - **Fallback:** N/A (gerenciado por AWS)
+
+2. **RDS PostgreSQL (Primary):**
+   - **SPOF:** Single master para writes
+   - **Mitigação:** RDS Multi-AZ (failover automático <60s), read replicas para reads
+   - **Fallback:** Promoção manual de read replica se Multi-AZ falhar
+
+3. **Payment Gateway Externo:**
+   - **SPOF:** Dependência crítica externa
+   - **Mitigação:** Retry 3x com backoff, circuit breaker, alerta SOC se downtime > 5min
+   - **Fallback:** Enfileirar transações em DLQ (Dead Letter Queue) para processamento posterior
+
+4. **Legacy Systems (CloudFoundry):**
+   - **SPOF:** SLA 95%, indisponibilidade esperada
+   - **Mitigação:** Cache defensivo (TTL 24h), circuit breaker, fallback SQS para retry assíncrono
+   - **Fallback:** Sistema continua operando com dados cacheados (eventual consistency)
+
+### Circuit Breakers e Fallbacks
+
+| Integração | Threshold | Timeout | Circuit Open Duration | Fallback Strategy |
+|------------|-----------|---------|----------------------|-------------------|
+| Carrier Integration (Correios) | 3 falhas consecutivas | 5s | 30s | Exibir apenas transportadoras privadas |
+| Carrier Integration (Privadas) | 3 falhas consecutivas | 3s | 30s | Omitir transportadora indisponível |
+| Legacy Systems Hub | 3 falhas consecutivas | 2s | 60s | Servir dados de cache (24h), enfileirar SQS |
+| Payment Gateway Adapter | 5 falhas consecutivas | 10s | 120s | Alerta crítico SOC, bloqueia novas compras |
+| Event Stream Processor | 10 falhas consecutivas | 5s | 60s | Eventos movidos para DLQ, alerta operacional |
+
+### Plano de Recuperação de Desastres (DR Plan)
+
+**Cenários Cobertos:**
+1. Falha completa de região AWS (us-east-1)
+2. Corrupção de banco de dados (ransomware, bug de aplicação)
+3. Falha de zona de disponibilidade (AZ) única
+
+**Procedimentos:**
+
+**1. Failover Cross-Region (us-east-1 → us-west-2):**
+```
+Detecção:
+- GuardDuty + CloudWatch detectam indisponibilidade (health checks falham por 5min)
+- Alerta automático via ServiceNow para equipe SRE
+
+Ação:
+- Promoção automática de RDS read replica em us-west-2 para primary
+- Route 53 health check falha, tráfego redirecionado para ALB us-west-2
+- ECS tasks em us-west-2 auto-scaled (min 5 tasks por serviço)
+- Kinesis cross-region replication ativado (já configurado)
+
+Validação:
+- Smoke tests automáticos (health checks, transações sintéticas)
+- Confirmação manual de SRE via dashboard
+
+RTO: 1 hora (Tier 1), 4 horas (Tier 2)
+RPO: 5 minutos (Tier 1 - WAL shipping), 15 minutos (Tier 2 - Kinesis replication)
+```
+
+**2. Restauração de Backup (Corrupção de Dados):**
+```
+Detecção:
+- Alertas de integridade de dados (checksums, constraint violations)
+- Reportes manuais de usuários/operadores
+
+Ação:
+- Identificação de snapshot RDS mais recente válido (automated backups 7 dias)
+- Restauração de snapshot em nova instância RDS
+- Validação de integridade (queries de sanidade, count records)
+- Cutover de aplicação para novo RDS endpoint
+
+RTO: 4 horas (restauração + validação)
+RPO: 1 hora (snapshots automáticos a cada hora)
+```
+
+**3. Game Day Scenarios (Simulações Trimestrais):**
+- **Cenário 1 (Q1):** Failover completo us-east-1 → us-west-2
+- **Cenário 2 (Q2):** Restauração de backup após corrupção simulada
+- **Cenário 3 (Q3):** Indisponibilidade de Payment Gateway (teste de fallback)
+- **Cenário 4 (Q4):** Falha de Legacy Systems (teste de cache + SQS)
+
+**Métricas de Sucesso:**
+- RTO atingido: ✅ / ❌
+- RPO atingido: ✅ / ❌
+- Dados perdidos: 0 (ideal), < 0.01% (aceitável)
+- Lessons learned documentadas em wiki corporativa
+
+**Rastreabilidade:**
+- ADR-002 (Multi-AZ, Multi-Region)
+- ADR-003 (Circuit Breakers)
+- ADR-006 (Legacy Hub com fallbacks)
+- Premissas de Governança (Game Days trimestrais mandatórios)
+
+---
+
+## 5.3. Segurança e Conformidade
+
+### Autenticação e Autorização
+
+| Componente | Mecanismo | Token Lifetime | Rotação | Restrição Organizacional |
+|------------|-----------|----------------|---------|--------------------------|
+| Mobile App → API Gateway | JWT (RS256) | Access: 15min, Refresh: 7 dias | Access renovado automaticamente 5min antes de expirar | - |
+| Backend inter-service | IAM Roles (AWS) | Temporário (1h via STS) | Automático | AWS mandatório |
+| Payment Gateway | API Key + HMAC signature | N/A (stateless) | Trimestral (rotação manual) | PCI-DSS compliance |
+| Legacy Systems | mTLS (mutual TLS) | N/A (certificate-based) | Anual (certificados CloudFoundry) | CloudFoundry mandatório |
+
+### Criptografia
+
+**Em Trânsito:**
+- **Mobile ↔ API Gateway:** TLS 1.3 (cipher suites: TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256)
+- **API Gateway ↔ Backend:** TLS 1.2+ (internal ALB)
+- **Backend ↔ RDS:** TLS 1.2 (SSL mode: require)
+- **Backend ↔ Redis:** TLS 1.2 (in-transit encryption habilitado)
+- **Backend ↔ External APIs:** TLS 1.2+ (validação de certificados obrigatória)
+
+**Em Repouso:**
+- **RDS PostgreSQL:** AES-256 (AWS KMS encryption)
+- **S3 (Etiquetas PDF, Backups):** AES-256-GCM (SSE-KMS)
+- **ElastiCache Redis:** AES-256 (at-rest encryption habilitado)
+- **EBS Volumes (ECS):** AES-256 (AWS KMS)
+- **Kinesis Data Streams:** AES-256 (server-side encryption)
+- **Mobile Local Storage:** AES-256 (Keychain iOS, Keystore Android)
+
+### Controle de Acesso entre Componentes
+
+**Princípio de Least Privilege:**
+- IAM Roles granulares por serviço (ex: ShippingServiceRole só acessa RDS shipping DB, S3 labels bucket)
+- Security Groups (AWS) com whitelisting específico (ex: API Gateway só aceita 443 de Internet, backend só aceita tráfego de API Gateway)
+- Network ACLs isolam Data Tier (RDS, Redis em subnets privadas isoladas)
+
+**Exemplo:**
+```
+ShippingOrchestratorRole:
+  Permissions:
+    - RDS: SELECT/INSERT/UPDATE em shipping.* tables
+    - S3: PutObject em labels-prod bucket
+    - Step Functions: StartExecution em PurchaseLabelSaga
+    - EventBridge: PutEvents em default bus
+  Deny:
+    - RDS: DROP, TRUNCATE, ALTER
+    - S3: DeleteObject, DeleteBucket
+```
+
+### Auditoria e Compliance
+
+**LGPD (Lei Geral de Proteção de Dados - Brasil):**
+- ✅ Consentimento explícito (opt-in) registrado em Consent Management Service (DynamoDB)
+- ✅ Histórico imutável de consentimentos (append-only log)
+- ✅ Direito de portabilidade (API GET /v1/profiles/export retorna JSON completo)
+- ✅ Direito ao esquecimento (API DELETE /v1/profiles soft-delete + anonimização)
+- ✅ DPO (Data Protection Officer) designado corporativamente
+- ✅ Logs de acesso a dados pessoais (CloudTrail, AppDynamics)
+
+**GDPR (General Data Protection Regulation - União Europeia):**
+- ✅ Mesmos controles de LGPD (superset)
+- ✅ Data residency: dados de clientes EU podem ser replicados para região eu-west-1 (futuro)
+- ✅ Privacy by design (criptografia end-to-end, minimização de dados)
+
+**PCI-DSS Level 1 (Payment Card Industry Data Security Standard):**
+- ✅ SAQ-A (Self-Assessment Questionnaire A - escopo reduzido)
+- ✅ Tokenização de cartões (PAN nunca trafega no backend)
+- ✅ Payment Gateway Adapter isolado (network segmentation)
+- ✅ Logs de Payment Adapter não contêm dados sensíveis (últimos 4 dígitos + transaction_id)
+- ✅ Rotação trimestral de API keys de gateway
+- ✅ Auditoria anual externa (QSA - Qualified Security Assessor)
+
+**WCAG 2.1 Level AA (Web Content Accessibility Guidelines):**
+- ✅ Mobile app implementa suporte a leitores de tela (TalkBack Android, VoiceOver iOS)
+- ✅ Contraste mínimo de cores 4.5:1 (texto normal), 3:1 (texto grande)
+- ✅ Tamanhos de toque mínimos 44x44 pontos (iOS), 48x48 dp (Android)
+- ✅ Navegação por teclado (foco visível, ordem lógica)
+
+**ABNT NBR 17060 (Acessibilidade Digital - Brasil):**
+- ✅ Superset de WCAG 2.1, requisitos adicionais atendidos
+
+### Integração com SOC (Security Operations Center)
+
+**Eventos de Segurança Monitorados:**
+- Falhas de autenticação (>5 tentativas em 1min → alerta brute force)
+- Mudanças em IAM policies (CloudTrail → ServiceNow)
+- Anomalias de tráfego (GuardDuty → SIEM corporativo)
+- Vulnerabilidades em containers (Wiz scan → ServiceNow)
+- Acessos administrativos (Bastion SSH via SSM Session Manager → CloudTrail)
+
+**Fluxo:**
+```
+GuardDuty/Wiz detecta anomalia
+  ↓
+Evento enviado para EventBridge
+  ↓
+Lambda enriquece com contexto (user_id, IP, resource)
+  ↓
+ServiceNow ticket criado (categoria: Security Incident)
+  ↓
+SOC notificado (Slack + email)
+  ↓
+Resposta coordenada (revogação de sessões, bloqueio de IP)
+```
+
+### Gestão de Segredos e Rotação de Credenciais
+
+**AWS Secrets Manager:**
+- Database passwords (RDS)
+- API keys (Payment Gateway, Carriers, ServiceNow)
+- Rotação automática trimestral (Lambda rotation functions)
+
+**AWS Systems Manager Parameter Store:**
+- Configurações não-sensíveis (endpoints, feature flags)
+- Versionamento habilitado (rollback facilitado)
+
+**Rotação de Chaves Criptográficas:**
+- AWS KMS: Rotação automática anual (managed keys)
+- JWT signing keys: Rotação semestral (manual, coordenada com mobile app releases)
+
+### Testes de Segurança
+
+**SAST (Static Application Security Testing):**
+- Tool: SonarQube (integrado em GitHub Actions)
+- Frequência: A cada commit (PR blocks)
+- Vulnerabilidades críticas: 0 toleradas (build fails)
+
+**DAST (Dynamic Application Security Testing):**
+- Tool: OWASP ZAP (automated scans em staging)
+- Frequência: Semanal
+- Vulnerabilidades high: SLA 7 dias para correção
+
+**PEN Testing (Penetration Testing):**
+- Frequência: Semestral (mandatório por PCI-DSS)
+- Escopo: APIs públicas, mobile app, infraestrutura AWS
+- Executado por: QSA externo certificado
+- Relatório: Entregue para SOC + time de segurança corporativa
+
+**Rastreabilidade:**
+- ADR-004 (PCI-DSS compliance)
+- ADR-007 (Integração SOC)
+- Premissas de Conformidade (LGPD/GDPR/PCI-DSS mandatórios)
+- INC01 (Consent Management), INC02 (Payment)
+
+---
+
+## 5.4. Observabilidade e Rastreamento
+
+### Logging (Centralizado e Estruturado)
+
+**Formato:**
+- Structured logging JSON (todos os serviços backend)
+- Campos obrigatórios: `timestamp`, `level`, `service`, `trace_id`, `span_id`, `user_id`, `message`
+- Campos opcionais: `error_stack`, `request_id`, `duration_ms`, `http_status`
+
+**Exemplo:**
+```json
+{
+  "timestamp": "2026-02-05T16:45:23.123Z",
+  "level": "ERROR",
+  "service": "shipping-orchestrator",
+  "trace_id": "abc123def456",
+  "span_id": "span789",
+  "user_id": "user_12345",
+  "message": "Payment authorization failed",
+  "error_stack": "...",
+  "payment_gateway_response_code": "insufficient_funds",
+  "duration_ms": 1523
+}
+```
+
+**Destinos:**
+- **CloudWatch Logs:** Todos os logs de backend (retention 30 dias)
+- **AppDynamics:** Logs correlacionados com traces (analytics)
+- **S3:** Archive de logs (retention 7 anos para compliance, compressão GZIP)
+
+**Sanitização:**
+- Dados sensíveis (PAN, senhas, tokens) NUNCA logados
+- PII (email, nome) logados apenas com hash SHA-256 (reversível via lookup table restrito)
+
+### Métricas
+
+**Métricas de Negócio (CloudWatch Custom Metrics):**
+- `user_registrations` (counter)
+- `label_purchases_success` (counter)
+- `label_purchases_failed_by_reason` (counter, dimension: reason)
+- `payment_authorization_success_rate` (gauge, %)
+- `tracking_status_changes` (counter, dimension: carrier)
+- `push_notifications_delivered` (counter, dimension: platform)
+
+**Métricas Técnicas (CloudWatch + AppDynamics):**
+- `api_request_count` (counter, dimension: endpoint, http_status)
+- `api_request_duration_ms` (histogram, p50/p95/p99)
+- `circuit_breaker_state` (gauge, dimension: integration, values: CLOSED/OPEN/HALF_OPEN)
+- `cache_hit_rate` (gauge, %, dimension: cache_type)
+- `saga_compensation_rate` (gauge, %, dimension: saga_type)
+- `sync_queue_depth` (gauge, mobile app)
+
+**Métricas de Infraestrutura (CloudWatch):**
+- EC2/ECS: CPU, memória, network I/O
+- RDS: Connections, read/write IOPS, replication lag
+- Redis: Evictions, hit rate, memory usage
+- Lambda: Invocations, duration, throttles
+
+### Tracing Distribuído
+
+**Tools:**
+- **AppDynamics:** APM principal (backend Java/Spring Boot)
+- **AWS X-Ray:** Traces de Lambda functions, complementa AppDynamics
+
+**Instrumentação:**
+- Auto-instrumentation via AppDynamics Java Agent (Spring Boot)
+- Manual spans para operações críticas (Saga steps, cache lookups)
+- Correlation IDs propagados via headers HTTP: `X-Trace-ID`, `X-Span-ID`
+
+**Exemplo de Trace (Compra de Etiqueta):**
+```
+Trace ID: abc123def456
+├─ Span 1: API Gateway (50ms)
+├─ Span 2: Shipping Orchestrator (4.5s)
+│  ├─ Span 3: Carrier Integration - Correios (3.2s)
+│  ├─ Span 4: Carrier Integration - Fedex (1.8s)
+│  ├─ Span 5: Pricing Engine (200ms)
+│  ├─ Span 6: Payment Adapter (800ms)
+│  └─ Span 7: Label Service (500ms)
+└─ Total Duration: 4.55s
+```
+
+### Alertas e SLIs/SLOs
+
+**SLIs (Service Level Indicators):**
+- Availability: `(successful_requests / total_requests) * 100`
+- Latency: `p95_request_duration_ms < threshold`
+- Error Rate: `(5xx_errors / total_requests) * 100`
+
+**SLOs (Service Level Objectives):**
+
+| Serviço | SLO Availability | SLO Latency (p95) | SLO Error Rate |
+|---------|------------------|-------------------|----------------|
+| API Gateway + Identity | 99.9% | < 300ms | < 0.5% |
+| Shipping Orchestrator | 99.9% | < 5s | < 1.0% |
+| Tracking Service | 99.5% | < 3s | < 2.0% |
+| Payment Adapter | 99.9% | < 2s | < 0.1% (crítico) |
+
+**Alertas CloudWatch:**
+
+| Alerta | Condição | Threshold | Ação |
+|--------|----------|-----------|------|
+| High Error Rate | `5xx_errors > threshold` | 10 erros/5min | Slack + PagerDuty |
+| High Latency | `p95_duration > threshold` | Var por serviço | Slack |
+| Payment Failures | `payment_authorization_success_rate < 90%` | 1 datapoint | PagerDuty (crítico) + SOC |
+| Circuit Breaker Open | `circuit_breaker_state == OPEN` | 1min | Slack + ServiceNow ticket |
+| Saga Compensation Rate | `saga_compensation_rate > 5%` | 10min | Slack |
+| RDS High Connections | `db_connections > 400` | 5min | Auto-scale read replicas |
+
+### Dashboards Operacionais
+
+**Dashboard 1: Business Metrics (Datadog)**
+- User registrations (timeseries)
+- Label purchases (success vs. failed)
+- Revenue (calculated from payments)
+- Active users (DAU, MAU)
+
+**Dashboard 2: API Health (AppDynamics)**
+- Request rate por endpoint
+- Latency p50/p95/p99 por endpoint
+- Error rate por endpoint
+- Apdex score (Application Performance Index)
+
+**Dashboard 3: Infrastructure (CloudWatch)**
+- EC2/ECS resource utilization
+- RDS performance (IOPS, connections, lag)
+- Redis hit rate
+- Lambda invocations
+
+**Dashboard 4: Security (SIEM corporativo + Wiz)**
+- Failed authentication attempts
+- IAM policy changes
+- Vulnerabilities detected (severity: critical/high/medium)
+- GuardDuty findings
+
+### Correlação de Eventos de Segurança
+
+**Integração AppDynamics ↔ Wiz ↔ ServiceNow:**
+```
+AppDynamics detecta anomalia performance (spike latency)
+  ↓
+Correlation via trace_id com logs CloudWatch
+  ↓
+Wiz detecta vulnerabilidade em container relacionado
+  ↓
+Evento correlacionado enviado para ServiceNow
+  ↓
+SOC investiga (timeline: AppDynamics + Wiz + CloudTrail)
+```
+
+**Rastreabilidade:**
+- ADR-007 (Observabilidade End-to-End)
+- Premissas de Observabilidade (AppDynamics + CloudWatch + Datadog mandatórios)
+- Todos os incrementos (INC01-INC04)
+
+---
+
+## 5.5. Manutenibilidade e Operabilidade
+
+### Estratégia de Versionamento de APIs
+
+**Semântico (SemVer):**
+- MAJOR.MINOR.PATCH (ex: v2.3.1)
+- MAJOR: Breaking changes (ex: remoção de campo obrigatório)
+- MINOR: Adição de funcionalidade backward-compatible
+- PATCH: Bug fixes
+
+**Versionamento de Endpoints:**
+- URL-based: `/v1/profiles`, `/v2/profiles`
+- Header-based: `Accept: application/vnd.postal-api.v2+json` (futuro)
+
+**Exemplo:**
+```
+GET /v1/shipping/quotes → Retorna {carrier, price, deadline}
+GET /v2/shipping/quotes → Retorna {carrier, price, deadline, carbon_footprint} (novo campo)
+```
+
+### Backward Compatibility
+
+**Política:**
+- Versões suportadas: N (current) + N-1 (previous)
+- Deprecation period: 6 meses (aviso via headers: `X-API-Warn: Deprecated`)
+- Sunset: Após 6 meses, v1 retorna `410 Gone`
+
+**Mobile App:**
+- Força update apenas para breaking changes críticos de segurança
+- Feature flags controlam habilita ção de features por versão de app (ex: v2.1.0+ requerido para usar QR Code V2)
+
+### Deploy Independente de Componentes
+
+**Blue-Green Deployment (ECS):**
+```
+1. Nova versão (green) deployada em paralelo com atual (blue)
+2. Health checks em green (smoke tests, synthetic transactions)
+3. API Gateway redireciona 10% tráfego para green (canary)
+4. Monitoramento de métricas (latency, error rate) por 10min
+5. Se OK: 100% tráfego para green, blue standby 1h
+6. Se NOK: rollback automático para blue
+```
+
+**Rollback:**
+- Automático: Se error rate > 5% ou p95 latency > 2x baseline
+- Manual: Comando CLI `aws ecs update-service --force-new-deployment --task-definition blue`
+- Tempo de rollback: < 2min
+
+### Testabilidade
+
+**Pirâmide de Testes:**
+```
+      E2E (5%)
+     ┌───────┐
+    Integration (15%)
+   ┌─────────────┐
+  Unit Tests (80%)
+ ┌────────────────┐
+```
+
+**Unit Tests:**
+- Coverage target: >80% (gate de CI/CD)
+- Framework: JUnit 5 (Java), XCTest (iOS), JUnit (Android)
+- Mocks: Mockito (Java), Mockk (Kotlin)
+
+**Integration Tests:**
+- Testcontainers (PostgreSQL, Redis containers efêmeros)
+- Mock servers para APIs externas (WireMock)
+- Testes de integração inter-service via HTTP
+
+**E2E Tests:**
+- Selenium (web admin - futuro)
+- Appium (mobile app - smoke tests críticos)
+- Postman Collections (API contracts)
+
+**UAT (User Acceptance Testing):**
+- Staging environment com dados anonimizados de produção
+- Beta testers internos (50 usuários)
+- TestFlight (iOS), Google Play Beta (Android)
+
+### Estratégia de CI/CD
+
+**Pipeline GitHub Actions:**
+
+**1. Build & Test (triggered on: push, pull_request):**
+```yaml
+jobs:
+  build:
+    - Checkout code
+    - Setup Java 17 / Node 18
+    - Run unit tests (JUnit, coverage >80%)
+    - Run SAST (SonarQube)
+    - Build Docker image
+    - Push to AWS ECR (tagged: commit_sha)
+```
+
+**2. Deploy to Staging (triggered on: merge to main):**
+```yaml
+jobs:
+  deploy_staging:
+    - Pull image from ECR
+    - Update ECS task definition (staging)
+    - Deploy via AWS CodeDeploy (blue-green)
+    - Run integration tests (Testcontainers)
+    - Run E2E tests (Postman Collections)
+    - DAST scan (OWASP ZAP)
+```
+
+**3. Deploy to Production (triggered on: manual approval):**
+```yaml
+jobs:
+  deploy_production:
+    - Approval gate (Release Board via ServiceNow)
+    - Pull image from ECR
+    - Update ECS task definition (production)
+    - Deploy via AWS CodeDeploy (blue-green, canary 10% → 100%)
+    - Monitor CloudWatch Alarms (10min window)
+    - Auto-rollback if alarms triggered
+    - Notify Slack + ServiceNow
+```
+
+**Artifacts Management:**
+- AWS CodeArtifact: Maven packages (Java), npm packages (Node)
+- AWS ECR: Docker images (retention: 30 imagens, 90 dias)
+- Semantic versioning: `1.2.3-rc.1` (release candidate), `1.2.3` (production)
+
+### Automação de Infraestrutura (IaC)
+
+**Tool:** Terraform (HashiCorp Configuration Language)
+
+**Estrutura:**
+```
+terraform/
+├── modules/
+│   ├── vpc/
+│   ├── ecs/
+│   ├── rds/
+│   ├── redis/
+│   └── monitoring/
+├── environments/
+│   ├── dev/
+│   ├── staging/
+│   └── production/
+└── shared/
+```
+
+**Workflow:**
+```
+1. Develop IaC changes em feature branch
+2. `terraform plan` em PR (comentário automático com diff)
+3. Aprovação de arquiteto via PR review
+4. Merge to main → `terraform apply` em staging (auto)
+5. Validação manual em staging
+6. `terraform apply` em production (manual, aprovação Release Board)
+```
+
+**State Management:**
+- Terraform state em S3 (bucket: `terraform-state-prod`)
+- State locking via DynamoDB (tabela: `terraform-locks`)
+- Encryption at-rest (SSE-KMS)
+
+### Runbooks e Playbooks Operacionais
+
+**Runbook 1: High Error Rate (5xx)**
+```markdown
+## Symptoms
+- CloudWatch Alarm: `5xx_errors > 10/5min`
+- User complaints: "Erro ao carregar aplicativo"
+
+## Investigation
+1. Check AppDynamics: Identify service with high error rate
+2. Check CloudWatch Logs: Filter by `level:ERROR`, last 10min
+3. Check trace_id of failed requests → correlate with APM
+
+## Resolution
+- If database connection pool exhausted: Scale ECS tasks (+2)
+- If third-party API timeout: Verify circuit breaker state, check carrier status page
+- If memory leak: Restart ECS tasks (rolling restart)
+
+## Escalation
+- If unresolved in 15min: Page on-call SRE (PagerDuty)
+```
+
+**Runbook 2: Payment Authorization Failing**
+```markdown
+## Symptoms
+- CloudWatch Alarm: `payment_authorization_success_rate < 90%`
+- SOC alerta: "Critical - Payment Gateway Integration"
+
+## Investigation
+1. Check Payment Gateway status page (external)
+2. Check circuit breaker state (should be OPEN if gateway down)
+3. Check CloudWatch Logs: Filter `service:payment-adapter`, `level:ERROR`
+
+## Resolution
+- If gateway down: Wait for recovery, circuit breaker will auto-close after 2min
+- If gateway timeout: Increase timeout from 10s to 15s (config change)
+- If authentication error: Rotate API key (Secrets Manager)
+
+## Communication
+- If downtime > 10min: Post in #incident-response Slack
+- Create ServiceNow incident (category: Payment Critical)
+```
+
+**Playbook: Disaster Recovery Failover**
+```markdown
+## Trigger
+- Game Day scenario OR real disaster (region failure)
+
+## Steps
+1. Assess: Verify primary region (us-east-1) health
+2. Decision: Failover GO/NO-GO (SRE lead)
+3. Execute:
+   - Promote RDS read replica (us-west-2) to primary
+   - Update Route 53 health check (failover to us-west-2 ALB)
+   - Scale ECS tasks in us-west-2 (min 5 per service)
+   - Validate smoke tests (health checks, synthetic transactions)
+4. Monitor: Watch CloudWatch Dashboards (us-west-2 region)
+5. Communicate: Slack #incident-response, ServiceNow incident
+6. Post-Mortem: Document lessons learned (wiki)
+
+## Rollback (Failback to us-east-1)
+- Only after primary region restored and validated
+- Reverse replication: us-west-2 → us-east-1
+- Cutover during low-traffic window (Sunday 2AM BRT)
+```
+
+**Rastreabilidade:**
+- ADR-007 (Observabilidade)
+- ADR-009 (CI/CD)
+- Premissas de Governança (Runbooks mandatórios para transição BAU)
+- Todos os incrementos (INC01-INC04)
+
+---
+
+## 5.6. Governança e Transição para BAU
+
+### Estrutura de Governança
+
+**Fóruns de Decisão:**
+
+**1. SteerCo (Steering Committee) - Mensal**
+- **Participantes:** VP Engineering, VP Product, Arquiteto Sênior, Tech Lead, Product Manager
+- **Objetivo:** Decisões estratégicas (roadmap, budget, alocação de recursos)
+- **Deliverables:** Ata com decisions log, action items, OKRs progress
+- **Cadência:** Última sexta-feira do mês, 10h-11h BRT
+
+**2. Design Forum - Quinzenal**
+- **Participantes:** Arquitetos corporativos, Tech Leads de produto, Security Lead
+- **Objetivo:** Validação de decisões técnicas (ADRs), design reviews
+- **Deliverables:** ADRs aprovados, design documents (HLD/LLD)
+- **Cadência:** Quintas-feiras, 14h-15h BRT
+
+**3. Release Board - Semanal (pre-release)**
+- **Participantes:** Release Manager, Tech Lead, QA Lead, SOC Representative
+- **Objetivo:** Aprovação de releases para produção (gate de qualidade)
+- **Deliverables:** Go/No-Go decision, release notes
+- **Cadência:** Terças-feiras, 9h BRT (releases: terças 10h)
+
+**Aprovações Necessárias:**
+
+| Artefato | Aprovador | SLA Aprovação | Ferramenta |
+|----------|-----------|---------------|------------|
+| ADRs (decisões estruturais) | Design Forum | 1 semana | Confluence Wiki |
+| HLD (High Level Design) | Arquiteto Sênior | 3 dias úteis | Confluence |
+| LLD (Low Level Design) | Tech Lead | 2 dias úteis | Confluence |
+| Release para Produção | Release Board | 24h (go/no-go) | ServiceNow |
+| Mudanças de Infraestrutura (Terraform) | Arquiteto + SRE Lead | 2 dias úteis | GitHub PR |
+| Rotação de Secrets (Payment Gateway) | Security Lead + SOC | 24h | ServiceNow CAB |
+
+### Rastreabilidade de Requisitos
+
+**Jira Workflow:**
+```
+Epic (INC01, INC02, etc.)
+  ↓
+Story (Feature)
+  ↓
+Tasks (Implementation)
+  ↓
+GitHub PR (Code)
+  ↓
+Commit (SHA)
+  ↓
+Release (Tag: v1.2.3)
+```
+
+**Linkage Obrigatório:**
+- Story → Epic (Jira)
+- PR → Story (via commit message: `[INC02-123] Implement payment adapter`)
+- Release → Stories (Release Notes automáticas via script)
+
+**Exemplo:**
+```
+Epic: INC02 - Compra de Etiqueta
+  ├─ Story: INC02-100 - Implementar Shipping Orchestrator
+  │  ├─ Task: INC02-101 - Setup Saga State Machine (Step Functions)
+  │  ├─ Task: INC02-102 - Implementar Quote Aggregator
+  │  └─ PR #234: [INC02-100] Shipping Orchestrator Saga
+  │     └─ Commit abc123: feat(shipping): Add Saga coordinator
+  ├─ Story: INC02-110 - Implementar Payment Gateway Adapter
+  │  └─ PR #235: [INC02-110] Payment tokenization
+  └─ Release: v1.2.0 (tag: v1.2.0)
+     └─ Release Notes: "INC02 Stories: INC02-100, INC02-110"
+```
+
+### Documentação Corporativa
+
+**HLD (High Level Design) - Template:**
+```markdown
+# HLD: [Nome do Incremento]
+
+## 1. Visão Geral
+- Objetivo de negócio
+- Stakeholders
+
+## 2. Arquitetura Lógica
+- Diagrama C4 (Context, Containers)
+- ADRs relacionados
+
+## 3. Requisitos Não Funcionais
+- Performance, Segurança, Disponibilidade
+
+## 4. Riscos e Mitigações
+- Riscos técnicos, organizacionais
+
+## 5. Roadmap de Implementação
+- Fases, milestones
+
+**Aprovação:** Arquiteto Sênior + Design Forum
+**Versionamento:** Confluence (versões mantidas)
+```
+
+**LLD (Low Level Design) - Template:**
+```markdown
+# LLD: [Nome do Componente]
+
+## 1. Responsabilidade
+- Bounded context, capabilities
+
+## 2. APIs
+- Endpoints REST (OpenAPI spec)
+- Eventos publicados/consumidos (schema Avro/JSON Schema)
+
+## 3. Modelo de Dados
+- Entidades, relacionamentos (ER diagram)
+- Índices, particionamento
+
+## 4. Lógica de Negócio
+- Pseudocódigo de fluxos críticos
+- Validações, regras
+
+## 5. Testes
+- Estratégia de testes (unit, integration)
+- Cenários de teste
+
+**Aprovação:** Tech Lead
+**Versionamento:** Confluence
+```
+
+**DR Plans (Disaster Recovery) - Template:**
+```markdown
+# DR Plan: [Nome do Sistema]
+
+## 1. RTO/RPO
+- Por tier (Tier 1: 1h/5min, etc.)
+
+## 2. Cenários Cobertos
+- Falha de região, corrupção de dados, etc.
+
+## 3. Procedimentos
+- Step-by-step de failover, restauração
+
+## 4. Game Day Scenarios
+- Cronograma trimestral, responsáveis
+
+## 5. Contatos
+- On-call SRE, SOC, gerência
+
+**Aprovação:** Arquiteto + SRE Lead
+**Versionamento:** Confluence
+```
+
+**Especificações de Interface:**
+- OpenAPI 3.0 (REST APIs) - versionado em GitHub (`/docs/openapi/`)
+- AsyncAPI (eventos) - versionado em GitHub (`/docs/asyncapi/`)
+
+### Transição para BAU (Business as Usual)
+
+**Modelo RACI:**
+
+| Atividade | Responsible | Accountable | Consulted | Informed |
+|-----------|-------------|-------------|-----------|----------|
+| Incidentes P1 (críticos) | SRE On-Call | SRE Lead | Arquiteto, Tech Lead | VP Engineering |
+| Incidentes P2-P3 | Dev On-Call | Tech Lead | SRE | - |
+| Mudanças de Infra (Terraform) | SRE | Arquiteto | Tech Lead | - |
+| Releases (deploy produção) | Release Manager | Tech Lead | QA, SRE | SteerCo |
+| ADRs (decisões arquiteturais) | Arquiteto | Design Forum | Tech Leads, Security | - |
+| Rotação de Secrets | Security Engineer | Security Lead | SRE | SOC |
+| Game Days (DR simulations) | SRE Lead | Arquiteto | Todos os times | SteerCo |
+
+**Plano de Transferência de Conhecimento:**
+
+**Fase 1: Shadow (Mês 1-2)**
+- Consultoria acompanha BAU em todas as atividades
+- Pair programming, pair ops (troubleshooting conjunto)
+- Runbooks criados e revisados
+
+**Fase 2: Reverse Shadow (Mês 3)**
+- BAU executa, consultoria observa e valida
+- Correções e ajustes em runbooks
+
+**Fase 3: Handoff (Mês 4)**
+- BAU assume ownership completo
+- Consultoria em standby (on-demand)
+
+**Artefatos de Handoff:**
+- ✅ HLD/LLD completos e aprovados
+- ✅ Runbooks validados em Game Days
+- ✅ Documentação de APIs (OpenAPI, AsyncAPI)
+- ✅ Configurações de infraestrutura (Terraform, documentado)
+- ✅ Dashboards operacionais (CloudWatch, AppDynamics, Datadog)
+- ✅ Modelo RACI definido
+- ✅ Plano de treinamento executado (8h de workshops)
+
+### Treinamento de Usuários e Operadores
+
+**Usuários Finais (Clientes):**
+- Onboarding in-app (tooltips, walkthroughs interativos)
+- FAQ integrado (seção Ajuda no app)
+- Vídeos tutoriais (YouTube, duração <2min cada)
+- Suporte via ServiceNow (tickets, chat futuro)
+
+**Operadores (Atendentes de Agência):**
+- Manual de validação de QR Code (PDF, 5 páginas)
+- Treinamento presencial (2h, hands-on)
+- Sistema de agência atualizado (interface de validação)
+
+**Equipe BAU (SRE, Dev):**
+- Workshop 1: Arquitetura geral (4h)
+- Workshop 2: Troubleshooting e runbooks (2h)
+- Workshop 3: Deploy e rollback (2h)
+- Documentação técnica completa (Confluence)
+
+### Game Day Scenarios (Simulações Operacionais)
+
+**Cronograma Trimestral:**
+
+**Q1 - Cenário: Failover Cross-Region**
+- Data: 15/03/2026, 14h-16h BRT (baixo tráfego)
+- Objetivo: Validar RTO/RPO Tier 1
+- Participantes: SRE, Arquiteto, Tech Lead, SOC
+- Métricas: RTO atingido (target: 1h), RPO atingido (target: 5min), dados perdidos (<0.01%)
+
+**Q2 - Cenário: Indisponibilidade de Payment Gateway**
+- Data: 15/06/2026, 10h-12h BRT (horário comercial, teste realista)
+- Objetivo: Validar circuit breaker e fallback
+- Participantes: SRE, Dev On-Call, Tech Lead
+- Métricas: Circuit breaker ativou corretamente, alertas disparados, comunicação efetiva
+
+**Q3 - Cenário: Corrupção de Banco de Dados**
+- Data: 15/09/2026, 14h-16h BRT
+- Objetivo: Validar restauração de backup
+- Participantes: SRE, DBA, Arquiteto
+- Métricas: RTO atingido (target: 4h), integridade de dados validada
+
+**Q4 - Cenário: Falha de Legacy Systems (CloudFoundry)**
+- Data: 15/12/2026, 14h-16h BRT
+- Objetivo: Validar cache defensivo e enfileiramento SQS
+- Participantes: SRE, Dev On-Call, Integration Lead
+- Métricas: Sistema continuou operando com dados cacheados, SQS processou fila após recovery
+
+**Lessons Learned:**
+- Documentadas em wiki corporativa (Confluence)
+- Revisão em Design Forum subsequente
+- Action items rastreados em Jira
+
+### Handover para Equipes de Suporte (L1/L2/L3)
+
+**L1 (Atendimento ao Cliente):**
+- Scripts de troubleshooting básico (FAQ, senha esquecida, conectividade)
+- Escalação para L2: Problemas técnicos não resolvidos em 10min
+
+**L2 (Suporte Técnico):**
+- Acesso a logs em CloudWatch (read-only, últimas 24h)
+- Runbooks simplificados (restart app, limpar cache)
+- Escalação para L3: Problemas de infraestrutura, erros 5xx persistentes
+
+**L3 (SRE / Dev On-Call):**
+- Acesso completo a infraestrutura (AWS Console, SSH via Bastion)
+- Runbooks completos (troubleshooting avançado, rollback)
+- Autoridade para executar mudanças emergenciais (hotfix)
+
+**Rastreabilidade:**
+- Premissas de Governança (SteerCos, Design Forums, Release Board mandatórios)
+- Premissas de Documentação (HLD/LLD, DR Plans, Runbooks obrigatórios)
+- Premissas de Transição BAU (Game Days trimestrais, modelo RACI, handover estruturado)
+- Todos os incrementos (INC01-INC04)
+
+# 6. Análise Técnica e Decisão de Stack
+
+## 6.1. Derivação de Requisitos Técnicos
+
+A partir dos drivers arquiteturais, incrementos e ADRs documentados, derivamos os seguintes requisitos técnicos que direcionam decisões de stack:
+
+| Requisito Técnico | Origem (Driver/INC/ADR) | Impacto Arquitetural | Prioridade |
+|-------------------|-------------------------|----------------------|------------|
+| **Operação offline-first com sincronização eventual** | Driver (INC01-04), ADR-001 | Local Storage Layer robusto, Sync Engine com filas, versionamento de schema | **Crítica** |
+| **Comunicação síncrona REST APIs** | INC01, INC02, INC04 | Framework backend com suporte HTTP/REST, API Gateway | **Alta** |
+| **Comunicação assíncrona (eventos)** | INC03, ADR-005 | Event broker (Kinesis), event processor (Lambda), pub/sub | **Alta** |
+| **Streaming e processamento near-real-time** | INC03 (rastreamento), ADR-005 | Stream processing platform (Kinesis Streams), Lambda triggers | **Alta** |
+| **Transações distribuídas com compensação** | INC02 (Saga), ADR-002 | Orquestrador de Saga (Step Functions), state management | **Alta** |
+| **Escalabilidade horizontal stateless** | Driver (picos sazonais), ADR-002 | Containers/Serverless, auto-scaling, cache distribuído | **Média** |
+| **Baixa latência (p95 <5s E2E)** | Driver (UX mobile), NFR 5.1 | Cache (Redis), CDN (futuro), otimização queries SQL | **Alta** |
+| **Tolerância a falhas de integrações externas** | ADR-003, ADR-005, ADR-006 | Circuit breakers (Resilience4j), fallbacks, DLQ | **Alta** |
+| **Consistência eventual (AP no CAP)** | ADR-001 (offline-first) | Event sourcing parcial, CQRS, idempotência | **Média** |
+| **Frontend reativo nativo mobile** | INC01-04 | Swift (iOS), Kotlin (Android), reactive UI frameworks | **Crítica** |
+| **Criptografia end-to-end** | ADR-004 (PCI-DSS), NFR 5.3 | TLS 1.3, AES-256, KMS para rotação de chaves | **Crítica** |
+| **Observabilidade distribuída** | ADR-007, NFR 5.4 | APM (AppDynamics), logs centralizados (CloudWatch), distributed tracing | **Alta** |
+| **Integração com sistemas legados (SOAP/REST)** | ADR-006 (CloudFoundry) | Protocol transformation, SOAP client libraries | **Média** |
+| **Conformidade PCI-DSS (tokenização)** | ADR-004, NFR 5.3 | Payment gateway SDK, nunca armazenar PAN | **Crítica** |
+| **Conformidade LGPD/GDPR (auditoria)** | NFR 5.3 | Append-only logs (DynamoDB), soft-delete, data export | **Alta** |
+| **Suporte a acessibilidade (WCAG 2.1)** | Driver (INC01), NFR 5.3 | Screen reader support (TalkBack, VoiceOver), semantic HTML | **Média** |
+| **CI/CD automatizado com gates** | ADR-009 (draft), NFR 5.5 | GitHub Actions, Terraform, blue-green deployment | **Alta** |
+| **Disaster Recovery cross-region** | ADR-008 (draft), NFR 5.2 | Multi-region replication (RDS, S3), failover automation | **Alta** |
+
+---
+
+## 6.2. Mapa de Categorias Tecnológicas
+
+| Categoria | Responsabilidade | Componentes Relacionados | Incrementos | Restrição Organizacional |
+|-----------|------------------|--------------------------|-------------|--------------------------|
+| **Cloud Provider** | Hospedagem de infraestrutura, compute, storage, networking | Todos os backend services, databases, message brokers | INC01-04 | **AWS mandatório** |
+| **PaaS Layer (Legacy Integration)** | Hospedagem de sistemas legados corporativos | Legacy Systems Integration Hub | INC02, INC03 | **CloudFoundry mandatório** |
+| **Frontend Mobile (iOS)** | UI nativa, local storage, geolocalização, acessibilidade | Mobile Client Application, Local Storage Layer | INC01-04 | - |
+| **Frontend Mobile (Android)** | UI nativa, local storage, geolocalização, acessibilidade | Mobile Client Application, Local Storage Layer | INC01-04 | - |
+| **Backend Framework (Microservices)** | REST APIs, business logic, dependency injection | Identity Service, Profile Service, Shipping Orchestrator, etc. | INC01-04 | - |
+| **API Gateway** | Roteamento, autenticação, rate limiting, aggregation | API Gateway | INC01-04 | **AWS API Gateway recomendado** |
+| **Event Broker / Streaming** | Pub/sub messaging, event log, stream processing triggers | Tracking Service → Event Stream Processor → Push Notification | INC03 | **AWS Kinesis recomendado** |
+| **Saga Orchestrator** | Coordenação de transações distribuídas, compensação | Shipping Orchestration Service (Saga pattern) | INC02 | **AWS Step Functions recomendado** |
+| **Database (Relational)** | Persistência ACID, queries complexas, integridade referencial | Identity, Profile, Shipping, Tracking, Location services | INC01-04 | **AWS RDS PostgreSQL recomendado** |
+| **Database (NoSQL - Document)** | Histórico imutável, append-only logs, alta write throughput | Consent Management Service (consentimentos auditáveis) | INC01, INC04 | **AWS DynamoDB recomendado** |
+| **Cache / State Management** | Redução de latência, armazenamento de sessões, cotações, status | Carrier Integration, Tracking Service, Legacy Hub | INC02, INC03 | **AWS ElastiCache Redis recomendado** |
+| **Object Storage** | Armazenamento de blobs (PDFs, backups, snapshots) | Label and QR Code Service (etiquetas PDF) | INC02 | **AWS S3 mandatório** |
+| **Message Queue (Async)** | Enfileiramento de operações, retry assíncrono, DLQ | Legacy Hub (fallback SQS), Event Stream Processor (DLQ) | INC02, INC03 | **AWS SQS recomendado** |
+| **Serverless Compute** | Event-driven processing, auto-scaling, pay-per-use | Event Stream Processor (Lambda), webhooks receivers | INC03 | **AWS Lambda mandatório** |
+| **Container Orchestration** | Deploy de microserviços, auto-scaling, health checks | Backend microservices (ECS Fargate) | INC01-04 | **AWS ECS Fargate recomendado** |
+| **Observability (APM)** | Distributed tracing, transaction profiling, bottleneck detection | Todos os backend services | INC01-04 | **AppDynamics mandatório** |
+| **Observability (Logs)** | Centralized logging, search, retention, compliance | Todos os componentes (backend, Lambda, mobile) | INC01-04 | **CloudWatch Logs mandatório** |
+| **Observability (Metrics)** | Custom metrics, dashboards, anomaly detection | API Gateway, backend services, RDS, Redis | INC01-04 | **CloudWatch Metrics mandatório** |
+| **Observability (Aggregation)** | Correlação multi-fonte, dashboards customizados | Agregação de CloudWatch + AppDynamics + X-Ray | INC01-04 | **Datadog opcional** |
+| **Security (Vulnerability Scanning)** | Container scanning, compliance checks, SAST/DAST | ECS tasks, Lambda functions, ECR images | INC01-04 | **Wiz mandatório** |
+| **Security (Threat Detection)** | Anomaly detection, intrusion detection, SIEM | VPC Flow Logs, CloudTrail, GuardDuty findings | INC01-04 | **AWS GuardDuty recomendado** |
+| **Security (Secrets Management)** | Rotação de credenciais, criptografia de secrets | Database passwords, API keys (Payment Gateway, Carriers) | INC01-04 | **AWS Secrets Manager recomendado** |
+| **Security (Encryption)** | Key management, rotação automática, envelope encryption | RDS, S3, Kinesis, mobile keychain/keystore | INC01-04 | **AWS KMS mandatório** |
+| **CI/CD (Build & Test)** | Workflows automatizados, gates de qualidade, SAST | GitHub Actions (build, test, SAST via SonarQube) | INC01-04 | **GitHub Actions mandatório** |
+| **CI/CD (Artifact Management)** | Versionamento de packages, Docker images | AWS CodeArtifact (Maven, npm), AWS ECR (Docker) | INC01-04 | **AWS CodeArtifact mandatório** |
+| **CI/CD (Deployment)** | Blue-green deploy, canary releases, rollback | AWS CodeDeploy (ECS blue-green) | INC01-04 | **AWS CodeDeploy recomendado** |
+| **Infrastructure as Code** | Provisionamento declarativo, versionamento, state management | Terraform (VPC, ECS, RDS, Redis, monitoring) | INC01-04 | - |
+| **ITSM Integration** | Ticketing, alertas, aprovações de releases, CAB | Support Ticketing Adapter, observability alerts, SOC integration | INC04 | **ServiceNow mandatório** |
+| **Push Notifications** | APNS (iOS), FCM (Android), delivery tracking | Push Notification Service | INC03 | - |
+| **Payment Gateway** | Tokenização, autorização, captura, estorno, PCI-DSS | Payment Gateway Adapter | INC02 | - |
+| **Protocol Transformation** | SOAP ↔ REST, XML ↔ JSON | Legacy Systems Integration Hub | INC02, INC03 | - |
+| **Circuit Breaker / Resilience** | Failure isolation, fallbacks, retry policies | Carrier Integration, Legacy Hub, Payment Adapter | INC02, INC03 | - |
+
+---
+
+## 6.3. Alternativas de Stack por Categoria
+
+### Cloud Provider
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **AWS** | Consolidado | Alta (todos os serviços necessários disponíveis) | **Mandatório** |
+| Azure | Consolidado | Alta (equivalentes disponíveis) | Não |
+| Google Cloud Platform | Consolidado | Alta (equivalentes disponíveis) | Não |
+
+**Recomendação:** AWS (mandatório organizacional, expertise corporativa consolidada)
+
+---
+
+### Frontend Mobile (iOS)
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **Swift + SwiftUI** | Consolidado | Alta (nativo, performance, acessibilidade) | Não |
+| Objective-C + UIKit | Legacy | Média (nativo, mas verbose, menos features modernas) | Não |
+| React Native | Estável | Baixa (não atende acessibilidade nativa WCAG 2.1 completamente) | Não |
+| Flutter | Emergente | Média (performance boa, mas acessibilidade ainda limitada) | Não |
+
+**Recomendação:** Swift + SwiftUI (nativo, performance, acessibilidade completa, expertise interna)
+
+---
+
+### Frontend Mobile (Android)
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **Kotlin + Jetpack Compose** | Consolidado | Alta (nativo, performance, acessibilidade) | Não |
+| Java + XML Layouts | Legacy | Média (nativo, mas verbose, menos reactive) | Não |
+| React Native | Estável | Baixa (não atende acessibilidade nativa completamente) | Não |
+| Flutter | Emergente | Média (performance boa, mas acessibilidade limitada) | Não |
+
+**Recomendação:** Kotlin + Jetpack Compose (nativo, performance, acessibilidade completa, expertise interna)
+
+---
+
+### Backend Framework (Microservices)
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **Spring Boot (Java 17)** | Consolidado | Alta (REST APIs, DI, integração AWS, AppDynamics) | Não (mas expertise corporativa) |
+| Node.js + Express | Consolidado | Média (REST APIs, mas menos robusto para enterprise) | Não |
+| Go + Gin | Emergente | Média (performance excelente, mas menos features enterprise) | Não |
+| Python + FastAPI | Estável | Média (REST APIs, mas performance inferior para alta carga) | Não |
+
+**Recomendação:** Spring Boot Java 17 (expertise corporativa, integração AppDynamics nativa, robustez enterprise)
+
+---
+
+### Database (Relational)
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **AWS RDS PostgreSQL** | Consolidado | Alta (ACID, JSON support, PostGIS geoespacial, Multi-AZ) | Recomendado (AWS) |
+| AWS RDS MySQL | Consolidado | Média (ACID, mas menos features avançadas que PostgreSQL) | Não |
+| AWS Aurora PostgreSQL | Consolidado | Alta (performance superior, mas custo 2-3x RDS) | Não |
+| Self-managed PostgreSQL (EC2) | Consolidado | Baixa (overhead operacional, sem Multi-AZ managed) | Não |
+
+**Recomendação:** AWS RDS PostgreSQL Multi-AZ (balanceia features, performance, custo, operabilidade)
+
+---
+
+### Database (NoSQL - Document)
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **AWS DynamoDB** | Consolidado | Alta (append-only logs, alta write throughput, serverless) | Recomendado (AWS) |
+| MongoDB (AWS DocumentDB) | Consolidado | Média (document store, mas menos optimizado para append-only) | Não |
+| Self-managed Cassandra (EC2) | Consolidado | Baixa (overhead operacional, overkill para volumes do MVP) | Não |
+
+**Recomendação:** AWS DynamoDB (serverless, pay-per-use, otimizado para append-only logs de consentimento)
+
+---
+
+### Cache / State Management
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **AWS ElastiCache Redis** | Consolidado | Alta (cache distribuído, pub/sub, cluster mode, Multi-AZ) | Recomendado (AWS) |
+| AWS ElastiCache Memcached | Consolidado | Média (cache simples, mas sem persistência, pub/sub) | Não |
+| Self-managed Redis (EC2) | Consolidado | Baixa (overhead operacional, sem Multi-AZ managed) | Não |
+
+**Recomendação:** AWS ElastiCache Redis Cluster Mode (features completas, Multi-AZ, integração AWS)
+
+---
+
+### Event Broker / Streaming
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **AWS Kinesis Data Streams** | Consolidado | Alta (event log, Lambda triggers, cross-region replication) | Recomendado (AWS) |
+| AWS EventBridge | Consolidado | Média (pub/sub excelente, mas não é event log persistente) | Não (usado complementar) |
+| Apache Kafka (MSK) | Consolidado | Alta (event log robusto, mas overhead operacional) | Não |
+| Self-managed Kafka (EC2) | Consolidado | Baixa (overhead operacional significativo) | Não |
+
+**Recomendação:** AWS Kinesis Data Streams (serverless, pay-per-use, integração Lambda nativa, cross-region replication)
+
+---
+
+### Saga Orchestrator
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **AWS Step Functions** | Consolidado | Alta (visual workflow, compensação, integração AWS services) | Recomendado (AWS) |
+| Temporal.io | Emergente | Alta (Saga robusto, mas requer cluster self-managed) | Não |
+| Camunda (BPMN) | Consolidado | Média (enterprise workflow, mas overhead para casos simples) | Não |
+| Custom Saga (código) | N/A | Baixa (complexidade alta, bugs, sem visualização) | Não |
+
+**Recomendação:** AWS Step Functions (integração AWS nativa, visual workflow, baixo overhead operacional)
+
+---
+
+### Observability (APM)
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **AppDynamics** | Consolidado | Alta (distributed tracing, profiling, integração corporativa) | **Mandatório** |
+| Datadog APM | Consolidado | Alta (APM robusto, mas não é stack corporativo) | Não |
+| New Relic | Consolidado | Média (APM bom, mas menos features que AppDynamics) | Não |
+| AWS X-Ray | Estável | Média (tracing básico, insuficiente sozinho) | Não (usado complementar para Lambda) |
+
+**Recomendação:** AppDynamics (mandatório corporativo, integração com SOC via ServiceNow)
+
+---
+
+### CI/CD (Build & Test)
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **GitHub Actions** | Consolidado | Alta (integração GitHub, workflows YAML, marketplace) | **Mandatório** |
+| AWS CodePipeline | Consolidado | Média (integração AWS nativa, mas menos flexível que Actions) | Não |
+| Jenkins | Consolidado | Baixa (overhead operacional, self-hosted) | Não |
+| GitLab CI | Consolidado | Média (similar Actions, mas stack não é corporativo) | Não |
+
+**Recomendação:** GitHub Actions (mandatório corporativo, integração com repositórios GitHub)
+
+---
+
+### Infrastructure as Code
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **Terraform** | Consolidado | Alta (multi-cloud, versionamento, state management, módulos) | Não (mas expertise interna) |
+| AWS CloudFormation | Consolidado | Média (integração AWS nativa, mas YAML verboso, menos features) | Não |
+| Pulumi | Emergente | Média (IaC em código TypeScript/Python, mas menos adoção) | Não |
+| AWS CDK | Estável | Média (IaC em código TypeScript, mas AWS-only) | Não |
+
+**Recomendação:** Terraform (multi-cloud, expertise interna, módulos reusáveis, state management robusto)
+
+---
+
+### Payment Gateway
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **Adyen** | Consolidado | Alta (PCI-DSS Level 1, tokenização, global, SDK mobile) | Não |
+| Stripe | Consolidado | Alta (PCI-DSS Level 1, tokenização, UX excelente, SDK mobile) | Não |
+| Braintree (PayPal) | Consolidado | Média (PCI-DSS Level 1, mas menos features que Adyen/Stripe) | Não |
+| PagSeguro | Consolidado (Brasil) | Baixa (local, mas menos features enterprise) | Não |
+
+**Recomendação:** Adyen ou Stripe (PCI-DSS Level 1, tokenização, SDK mobile nativo, suporte global)
+
+---
+
+### Protocol Transformation (SOAP ↔ REST)
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **Apache CXF (Java)** | Consolidado | Alta (SOAP client robusto, integração Spring Boot) | Não |
+| Spring WS | Consolidado | Alta (SOAP client nativo Spring, contract-first) | Não |
+| Custom (JAX-WS) | Consolidado | Média (baixo nível, mais controle, mas verbose) | Não |
+
+**Recomendação:** Apache CXF (integração Spring Boot nativa, SOAP client robusto, expertise Java)
+
+---
+
+### Circuit Breaker / Resilience
+
+| Alternativa | Maturidade | Aderência aos Drivers | Restrição Organizacional |
+|-------------|------------|------------------------|--------------------------|
+| **Resilience4j** | Consolidado | Alta (circuit breaker, retry, rate limiter, integração Spring Boot) | Não |
+| Netflix Hystrix | Legacy (deprecated) | Baixa (deprecated, substituído por Resilience4j) | Não |
+| Custom (código) | N/A | Baixa (complexidade, bugs, sem features avançadas) | Não |
+
+**Recomendação:** Resilience4j (consolidado, integração Spring Boot, features completas)
+
+---
+
+## 6.4. Análise de Trade-offs
+
+### Categoria: Cloud Provider - AWS
+
+**Pontos Fortes:**
+- Expertise corporativa consolidada (time já conhece serviços AWS)
+- Portfólio completo de serviços (ECS, RDS, S3, Kinesis, Lambda, Step Functions)
+- Multi-AZ e Multi-Region nativos (DR simplificado)
+- Integração com stack corporativo (AppDynamics, CloudWatch, Wiz)
+- SLAs robustos (API Gateway 99.95%, RDS Multi-AZ 99.95%)
+
+**Limitações:**
+- Vendor lock-in moderado (migrar para outra cloud requer refatoração significativa)
+- Custos podem escalar rapidamente sem otimização (monitoramento de billing essencial)
+- Alguns serviços têm curva de aprendizado íngreme (Step Functions, Kinesis)
+
+**Riscos:**
+- Falha de região AWS (mitigado com Multi-Region DR)
+- Mudanças de preços (AWS aumenta custos de serviços - monitorar announcements)
+- Sunset de serviços (raro, mas possível - mitigado com serviços consolidados)
+
+**Impactos:**
+- **Escalabilidade:** Excelente (auto-scaling nativo)
+- **Custo:** Médio-alto (pay-as-you-go, mas pode crescer sem governance)
+- **Operação:** Baixo overhead (serviços managed reduzem toil)
+
+**Complexidade:**
+- Setup inicial: Média (requer expertise em VPC, IAM, Security Groups)
+- Manutenção: Baixa (managed services reduzem patches, backups manuais)
+
+---
+
+### Categoria: Backend Framework - Spring Boot (Java 17)
+
+**Pontos Fortes:**
+- Expertise corporativa consolidada (time Java experiente)
+- Integração nativa com AppDynamics (agent Java robusto)
+- Ecossistema maduro (Spring Data, Spring Security, Spring Cloud)
+- Microservices patterns prontos (Eureka, Config Server, Gateway)
+- Performance adequada para carga esperada (JVM otimizada)
+
+**Limitações:**
+- Startup time mais lento que Go/Node (mitigado com JVM warm-up e ECS tasks sempre rodando)
+- Consumo de memória maior que Node/Go (mitigado com JVM tuning e Fargate right-sizing)
+- Curva de aprendizado para desenvolvedores não-Java (onboarding necessário)
+
+**Riscos:**
+- Fragmentação de versões Spring Boot (mitigado com política de upgrade semestral)
+- CVEs (Common Vulnerabilities and Exposures) em dependências (mitigado com Dependabot + Wiz scan)
+
+**Impactos:**
+- **Escalabilidade:** Excelente (stateless, horizontal scaling)
+- **Custo:** Médio (memória JVM requer instâncias maiores que Node/Go)
+- **Operação:** Baixo overhead (Spring Boot Actuator para health checks, métricas)
+
+**Complexidade:**
+- Setup inicial: Baixa (Spring Initializr, templates prontos)
+- Manutenção: Baixa (convenção over configuration, pouca configuração manual)
+
+---
+
+### Categoria: Database (Relational) - AWS RDS PostgreSQL
+
+**Pontos Fortes:**
+- ACID completo (transações distribuídas via 2PC se necessário)
+- JSON support (JSONB) para dados semi-estruturados (flexibilidade)
+- PostGIS para queries geoespaciais (Location Service - busca de agências)
+- Multi-AZ nativo (failover automático <60s)
+- Automated backups e point-in-time recovery (RPO 5min)
+
+**Limitações:**
+- Single master para writes (gargalo em write-heavy workloads - mitigado com read replicas)
+- Custo de replicação cross-region (dobro do custo, mas essencial para DR)
+- Connection pooling necessário (PgBouncer ou RDS Proxy para evitar exaustão de conexões)
+
+**Riscos:**
+- Exaustão de conexões (mitigado com pooling e monitoramento)
+- Replicação lag (mitigado com monitoramento CloudWatch + alerta se lag >10s)
+- Crescimento de storage (mitigado com particionamento de tabelas antigas)
+
+**Impactos:**
+- **Escalabilidade:** Boa (vertical scaling + read replicas, limitado por single master)
+- **Custo:** Médio (Multi-AZ dobra custo, read replicas adicionam ~70% cada)
+- **Operação:** Baixo overhead (managed service, automated backups, patches)
+
+**Complexidade:**
+- Setup inicial: Baixa (RDS console, alguns cliques)
+- Manutenção: Baixa (automated backups, patches, Multi-AZ managed)
+
+---
+
+### Categoria: Event Broker - AWS Kinesis Data Streams
+
+**Pontos Fortes:**
+- Event log persistente (retention 7 dias, extensível até 365 dias)
+- Lambda triggers nativos (processamento event-driven simplificado)
+- Cross-region replication (DR simplificado)
+- Sharding automático (enhanced fan-out)
+- Garantias de entrega (at-least-once, ordering per shard key)
+
+**Limitações:**
+- Throughput por shard limitado (1MB/s write, 2MB/s read - requer sharding adequado)
+- Custo por hora de shard (mesmo sem tráfego - mitigado com auto-scaling)
+- Não suporta filtering nativo (todo evento processado - filtro em Lambda)
+
+**Riscos:**
+- Under-provisioning de shards (throttling - mitigado com auto-scaling)
+- Over-provisioning de shards (custo desnecessário - mitigado com monitoramento de utilização)
+- Hot shards (um shard sobrecarregado - mitigado com shard key bem distribuído)
+
+**Impactos:**
+- **Escalabilidade:** Excelente (auto-scaling de shards, enhanced fan-out)
+- **Custo:** Médio (pay-per-shard-hour + pay-per-GB ingested)
+- **Operação:** Baixo overhead (serverless, sem clusters para gerenciar)
+
+**Complexidade:**
+- Setup inicial: Média (requer entendimento de sharding, shard keys)
+- Manutenção: Baixa (serverless, auto-scaling minimiza intervenções)
+
+---
+
+### Categoria: Observability (APM) - AppDynamics
+
+**Pontos Fortes:**
+- Distributed tracing robusto (correlation E2E de transações)
+- Transaction profiling (identifica gargalos em código)
+- Integração corporativa (SOC, ServiceNow, processos estabelecidos)
+- Auto-instrumentation Java (baixo overhead de setup)
+- Dashboards prontos (out-of-the-box para Spring Boot)
+
+**Limitações:**
+- Custo elevado (licença enterprise per-agent, ~$600/agent/ano)
+- Curva de aprendizado (features avançadas requerem treinamento)
+- Overhead de performance (agent Java adiciona ~5-10% latência)
+
+**Riscos:**
+- Vendor lock-in (migrar para Datadog/New Relic requer reconfiguração)
+- Custo crescente (cada novo microserviço = novo agent = custo adicional)
+
+**Impactos:**
+- **Escalabilidade:** N/A (não impacta escalabilidade de sistema)
+- **Custo:** Alto (licenças enterprise, mas justificado por MTTR reduzido)
+- **Operação:** Baixo overhead (auto-instrumentation, dashboards prontos)
+
+**Complexidade:**
+- Setup inicial: Baixa (agent Java via JVM args)
+- Manutenção: Média (configuração de custom metrics, dashboards específicos)
+
+---
+
+## 6.5. Recomendações Assistidas (Consolidado)
+
+| Categoria | Stack Recomendada | Justificativa | Alternativas Viáveis | Observações Futuras |
+|-----------|------------------|---------------|---------------------|---------------------|
+| **Cloud Provider** | AWS | Mandatório organizacional, expertise consolidada | Azure, GCP (se restrição for removida) | Monitorar custos via AWS Cost Explorer, alertas de billing |
+| **PaaS (Legacy)** | CloudFoundry | Mandatório organizacional, legados hospedados | N/A | Planejar migração gradual para containers (Strangler Fig) |
+| **Mobile iOS** | Swift + SwiftUI | Nativo, performance, acessibilidade WCAG 2.1 | Objective-C (legacy fallback) | Avaliar Swift 6.0+ features quando stable |
+| **Mobile Android** | Kotlin + Jetpack Compose | Nativo, performance, acessibilidade | Java (legacy fallback) | Avaliar Kotlin Multiplatform (KMP) para compartilhar lógica com iOS |
+| **Backend Framework** | Spring Boot 3.2 (Java 17) | Expertise, AppDynamics, ecossistema | Node.js (se precisar de startup rápido), Go (se precisar de performance extrema) | Avaliar Spring Boot 3.3+ features (virtual threads) |
+| **API Gateway** | AWS API Gateway | Integração AWS, rate limiting, WebSocket | Kong (se precisar de features avançadas open-source) | Monitorar latência (add ~10-30ms), considerar caching |
+| **Event Broker** | AWS Kinesis Data Streams | Event log, Lambda triggers, cross-region | AWS EventBridge (para pub/sub simples), Kafka MSK (se precisar de features Kafka) | Monitorar utilização de shards (auto-scaling) |
+| **Saga Orchestrator** | AWS Step Functions | Visual workflow, compensação, integração | Temporal.io (se Step Functions limitações aparecerem) | Monitorar custos (pay-per-state-transition) |
+| **Database (Relational)** | AWS RDS PostgreSQL Multi-AZ | ACID, PostGIS, Multi-AZ, backups | Aurora PostgreSQL (se performance for crítica >Ano 2) | Considerar Aurora em Ano 3 se write throughput virar gargalo |
+| **Database (NoSQL)** | AWS DynamoDB | Append-only logs, serverless, alta write | DocumentDB (se queries complexas necessárias) | Monitorar custos (on-demand vs. provisioned capacity) |
+| **Cache** | AWS ElastiCache Redis Cluster | Features completas, Multi-AZ, pub/sub | Memcached (se precisar apenas de cache simples) | Eviction policy: allkeys-lru, monitorar hit rate (target >80%) |
+| **Object Storage** | AWS S3 | Durabilidade 99.999999999%, lifecycle policies | N/A (S3 é padrão de facto) | Lifecycle policies para mover backups antigos para Glacier (redução de custo) |
+| **Message Queue** | AWS SQS | Enfileiramento, DLQ, serverless | N/A (SQS é padrão para AWS) | FIFO queues se ordering for crítico |
+| **Serverless Compute** | AWS Lambda (Node.js 18 / Python 3.11) | Event-driven, auto-scaling, pay-per-use | N/A (Lambda é padrão para AWS) | Cold start mitigation: provisioned concurrency para funções críticas |
+| **Container Orchestration** | AWS ECS Fargate | Serverless containers, integração AWS | EKS (se Kubernetes skills disponíveis) | Fargate reduz overhead vs. EKS, mas menos controle |
+| **Observability (APM)** | AppDynamics | Mandatório organizacional, distributed tracing | Datadog (se restrição removida) | Monitorar custo por agent, otimizar sampling rate |
+| **Observability (Logs)** | CloudWatch Logs | Mandatório (AWS), integração nativa | N/A | Retention 30 dias (production), archive S3 7 anos (compliance) |
+| **Observability (Metrics)** | CloudWatch Metrics | Mandatório (AWS), integração nativa | N/A | Custom metrics para business KPIs (user_registrations, etc.) |
+| **Observability (Aggregation)** | Datadog | Dashboards customizados, correlação | N/A (complementa AppDynamics + CloudWatch) | Opcional, avaliar custo-benefício vs. CloudWatch Dashboards |
+| **Security (Vuln Scan)** | Wiz | Mandatório organizacional, container scan | Aqua Security, Prisma Cloud (se restrição removida) | Integração com SOC via ServiceNow |
+| **Security (Threat Detection)** | AWS GuardDuty | Anomaly detection, integração VPC Flow | N/A | Integração com SOC via EventBridge → ServiceNow |
+| **Security (Secrets)** | AWS Secrets Manager | Rotação automática, versionamento | AWS Systems Manager Parameter Store (não-sensíveis) | Rotação trimestral de secrets críticos |
+| **Security (Encryption)** | AWS KMS | Envelope encryption, rotação anual | N/A | Rotação automática de managed keys |
+| **CI/CD (Build)** | GitHub Actions | Mandatório organizacional, workflows YAML | N/A | Self-hosted runners para jobs de longa duração |
+| **CI/CD (Artifacts)** | AWS CodeArtifact (Maven, npm), AWS ECR (Docker) | Mandatório organizacional, integração AWS | N/A | Retention: 30 imagens (ECR), packages versionados (CodeArtifact) |
+| **CI/CD (Deploy)** | AWS CodeDeploy | Blue-green ECS, canary releases | N/A | Monitorar rollback automático (CloudWatch Alarms) |
+| **IaC** | Terraform | Multi-cloud, state management, módulos | CloudFormation (se AWS-only for suficiente) | State em S3 + DynamoDB locking, módulos reusáveis |
+| **ITSM** | ServiceNow | Mandatório organizacional, tickets, alertas | N/A | Integração via REST API, webhooks para alertas |
+| **Push Notifications** | AWS SNS + APNS/FCM SDKs | Integração AWS, delivery tracking | OneSignal, Firebase Cloud Messaging (se precisar de features avançadas) | Monitorar delivery rate (target >95%) |
+| **Payment Gateway** | Adyen ou Stripe | PCI-DSS Level 1, tokenização, SDK mobile | N/A | Escolha final via PoC (UX, custo MDR, suporte Brasil) |
+| **Protocol Transform** | Apache CXF | SOAP client, integração Spring Boot | Spring WS (alternativa equivalente) | Cache de responses SOAP (Legacy Hub Redis) |
+| **Circuit Breaker** | Resilience4j | Circuit breaker, retry, rate limit | N/A | Thresholds calibrados em staging antes de produção |
+
+---
+
+# 7. Dataset Estruturado de Decisão Arquitetural
+
+Este dataset consolida a análise técnica em formato estruturado, pronto para serialização (JSON/YAML) e reutilização em ferramentas de governança, wikis corporativas ou sistemas de decisão arquitetural.
+
+---
+
+## 7.1. Technical Requirements
+
+```yaml
+technical_requirements:
+  - id: TR-001
+    name: "Operação offline-first com sincronização eventual"
+    origin: ["Driver-INC01-04", "ADR-001"]
+    impact: "Local Storage Layer robusto, Sync Engine com filas, versionamento de schema"
+    priority: "CRITICAL"
+  
+  - id: TR-002
+    name: "Comunicação síncrona REST APIs"
+    origin: ["INC01", "INC02", "INC04"]
+    impact: "Framework backend com suporte HTTP/REST, API Gateway"
+    priority: "HIGH"
+  
+  - id: TR-003
+    name: "Comunicação assíncrona (eventos)"
+    origin: ["INC03", "ADR-005"]
+    impact: "Event broker (Kinesis), event processor (Lambda), pub/sub"
+    priority: "HIGH"
+  
+  - id: TR-004
+    name: "Streaming e processamento near-real-time"
+    origin: ["INC03", "ADR-005"]
+    impact: "Stream processing platform (Kinesis Streams), Lambda triggers"
+    priority: "HIGH"
+  
+  - id: TR-005
+    name: "Transações distribuídas com compensação"
+    origin: ["INC02", "ADR-002"]
+    impact: "Orquestrador de Saga (Step Functions), state management"
+    priority: "HIGH"
+  
+  - id: TR-006
+    name: "Escalabilidade horizontal stateless"
+    origin: ["Driver-Picos-Sazonais", "ADR-002"]
+    impact: "Containers/Serverless, auto-scaling, cache distribuído"
+    priority: "MEDIUM"
+  
+  - id: TR-007
+    name: "Baixa latência (p95 <5s E2E)"
+    origin: ["Driver-UX-Mobile", "NFR-5.1"]
+    impact: "Cache (Redis), CDN (futuro), otimização queries SQL"
+    priority: "HIGH"
+  
+  - id: TR-008
+    name: "Tolerância a falhas de integrações externas"
+    origin: ["ADR-003", "ADR-005", "ADR-006"]
+    impact: "Circuit breakers (Resilience4j), fallbacks, DLQ"
+    priority: "HIGH"
+  
+  - id: TR-009
+    name: "Consistência eventual (AP no CAP)"
+    origin: ["ADR-001"]
+    impact: "Event sourcing parcial, CQRS, idempotência"
+    priority: "MEDIUM"
+  
+  - id: TR-010
+    name: "Frontend reativo nativo mobile"
+    origin: ["INC01-04"]
+    impact: "Swift (iOS), Kotlin (Android), reactive UI frameworks"
+    priority: "CRITICAL"
+  
+  - id: TR-011
+    name: "Criptografia end-to-end"
+    origin: ["ADR-004", "NFR-5.3"]
+    impact: "TLS 1.3, AES-256, KMS para rotação de chaves"
+    priority: "CRITICAL"
+  
+  - id: TR-012
+    name: "Observabilidade distribuída"
+    origin: ["ADR-007", "NFR-5.4"]
+    impact: "APM (AppDynamics), logs centralizados (CloudWatch), distributed tracing"
+    priority: "HIGH"
+  
+  - id: TR-013
+    name: "Integração com sistemas legados (SOAP/REST)"
+    origin: ["ADR-006"]
+    impact: "Protocol transformation, SOAP client libraries"
+    priority: "MEDIUM"
+  
+  - id: TR-014
+    name: "Conformidade PCI-DSS (tokenização)"
+    origin: ["ADR-004", "NFR-5.3"]
+    impact: "Payment gateway SDK, nunca armazenar PAN"
+    priority: "CRITICAL"
+  
+  - id: TR-015
+    name: "Conformidade LGPD/GDPR (auditoria)"
+    origin: ["NFR-5.3"]
+    impact: "Append-only logs (DynamoDB), soft-delete, data export"
+    priority: "HIGH"
+```
+
+---
+
+## 7.2. Technology Categories
+
+```yaml
+technology_categories:
+  - id: CAT-001
+    name: "Cloud Provider"
+    responsibility: "Hospedagem de infraestrutura, compute, storage, networking"
+    components: ["Todos os backend services", "databases", "message brokers"]
+    increments: ["INC01", "INC02", "INC03", "INC04"]
+    organizational_constraint: "AWS mandatório"
+  
+  - id: CAT-002
+    name: "Frontend Mobile (iOS)"
+    responsibility: "UI nativa, local storage, geolocalização, acessibilidade"
+    components: ["Mobile Client Application", "Local Storage Layer"]
+    increments: ["INC01", "INC02", "INC03", "INC04"]
+    organizational_constraint: null
+  
+  - id: CAT-003
+    name: "Backend Framework"
+    responsibility: "REST APIs, business logic, dependency injection"
+    components: ["Identity Service", "Profile Service", "Shipping Orchestrator"]
+    increments: ["INC01", "INC02", "INC03", "INC04"]
+    organizational_constraint: null
+  
+  - id: CAT-004
+    name: "Event Broker"
+    responsibility: "Pub/sub messaging, event log, stream processing triggers"
+    components: ["Tracking Service", "Event Stream Processor", "Push Notification"]
+    increments: ["INC03"]
+    organizational_constraint: "AWS Kinesis recomendado"
+  
+  - id: CAT-005
+    name: "Observability (APM)"
+    responsibility: "Distributed tracing, transaction profiling, bottleneck detection"
+    components: ["Todos os backend services"]
+    increments: ["INC01", "INC02", "INC03", "INC04"]
+    organizational_constraint: "AppDynamics mandatório"
+```
+
+---
+
+## 7.3. Stack Alternatives
+
+```yaml
+stack_alternatives:
+  - category_id: CAT-001
+    category_name: "Cloud Provider"
+    alternatives:
+      - name: "AWS"
+        maturity: "CONSOLIDATED"
+        driver_adherence: "HIGH"
+        organizational_constraint: "MANDATORY"
+      - name: "Azure"
+        maturity: "CONSOLIDATED"
+        driver_adherence: "HIGH"
+        organizational_constraint: "OPTIONAL"
+      - name: "Google Cloud Platform"
+        maturity: "CONSOLIDATED"
+        driver_adherence: "HIGH"
+        organizational_constraint: "OPTIONAL"
+  
+  - category_id: CAT-003
+    category_name: "Backend Framework"
+    alternatives:
+      - name: "Spring Boot (Java 17)"
+        maturity: "CONSOLIDATED"
+        driver_adherence: "HIGH"
+        organizational_constraint: "OPTIONAL (expertise interna)"
+      - name: "Node.js + Express"
+        maturity: "CONSOLIDATED"
+        driver_adherence: "MEDIUM"
+        organizational_constraint: "OPTIONAL"
+      - name: "Go + Gin"
+        maturity: "EMERGING"
+        driver_adherence: "MEDIUM"
+        organizational_constraint: "OPTIONAL"
+```
+
+---
+
+## 7.4. Trade-offs (Formato Canônico)
+
+```yaml
+trade_offs:
+  - technology: "AWS RDS PostgreSQL Multi-AZ"
+    category: "Database (Relational)"
+    strengths:
+      - "ACID completo, transações distribuídas via 2PC"
+      - "JSON support (JSONB) para dados semi-estruturados"
+      - "PostGIS para queries geoespaciais"
+      - "Multi-AZ nativo (failover automático <60s)"
+      - "Automated backups e point-in-time recovery (RPO 5min)"
+    limitations:
+      - "Single master para writes (gargalo em write-heavy workloads)"
+      - "Custo de replicação cross-region (dobro do custo)"
+      - "Connection pooling necessário (PgBouncer/RDS Proxy)"
+    risks:
+      - impact: "Exaustão de conexões"
+        mitigation: "Pooling + monitoramento CloudWatch"
+      - impact: "Replicação lag >10s"
+        mitigation: "Monitoramento + alerta se lag crítico"
+    scalability: "GOOD (vertical + read replicas, limitado por single master)"
+    cost: "MEDIUM (Multi-AZ dobra custo, read replicas +70% cada)"
+    operations: "LOW_OVERHEAD (managed service, automated backups)"
+    complexity:
+      setup: "LOW (RDS console, alguns cliques)"
+      maintenance: "LOW (automated backups, patches managed)"
+```
+
+---
+
+## 7.5. Recommendations (Formato Canônico)
+
+```yaml
+recommendations:
+  - category: "Cloud Provider"
+    recommended_stack: "AWS"
+    justification: "Mandatório organizacional, expertise consolidada, portfólio completo"
+    viable_alternatives: ["Azure", "GCP"]
+    future_observations:
+      - "Monitorar custos via AWS Cost Explorer mensal"
+      - "Alertas de billing (>$10K/mês trigger review)"
+      - "Considerar commitment (Reserved Instances) em Ano 2 para reduzir custo 30-40%"
+  
+  - category: "Backend Framework"
+    recommended_stack: "Spring Boot 3.2 (Java 17)"
+    justification: "Expertise corporativa, integração AppDynamics nativa, ecossistema maduro"
+    viable_alternatives: ["Node.js (se startup rápido for crítico)", "Go (se performance extrema necessária)"]
+    future_observations:
+      - "Avaliar Spring Boot 3.3+ features (virtual threads JEP 444) em Ano 2"
+      - "Considerar GraalVM native image se cold start virar problema"
+  
+  - category: "Database (Relational)"
+    recommended_stack: "AWS RDS PostgreSQL Multi-AZ"
+    justification: "ACID, PostGIS, Multi-AZ, backups automatizados, custo balanceado"
+    viable_alternatives: ["Aurora PostgreSQL (se performance for crítica >Ano 2)"]
+    future_observations:
+      - "Monitorar write throughput (se >5K writes/s sustained, considerar Aurora)"
+      - "Particionamento de tabelas antigas (ex: tracking_events após 6 meses)"
+      - "Considerar Aurora em Ano 3 se custo justificado por performance"
+```
+
+# 8. Roadmap de Evolução Arquitetural
+
+## 8.1. Limitações Atuais Conhecidas
+
+| Limitação | Componente Afetado | Impacto | Workaround Atual |
+|------------|---------------------|---------|------------------|
+| **Single master RDS (write bottleneck)** | RDS PostgreSQL | Write throughput limitado a ~5K writes/s sustained | Read replicas para reads, considerar Aurora em Ano 3 |
+| **Polling de rastreamento Correios (sem webhooks)** | Tracking Service | Latência de atualização 1-5min vs. <1s de webhooks | Polling inteligente com backoff exponencial minimiza custo |
+| **Circuit breaker pode gerar falsos positivos** | Carrier Integration, Legacy Hub | Cotações omitidas desnecessariamente se threshold muito agressivo | Threshold calibrado em staging (3 falhas, 30s open) |
+| **Cache pode servir dados desatualizados** | Carrier Integration (cotações), Legacy Hub (agências) | Divergência de preços, agências com horários errados | TTL curto (5min cotações, 24h agências) |
+| **Lambda cold start (Event Stream Processor)** | Event Stream Processor (Lambda) | Latência adicional 500ms-2s em primeiro evento após idle | Provisioned concurrency para funções críticas (custo +50%) |
+| **Mobile app force update apenas para breaking changes** | Mobile Client Application | Clientes com versões antigas podem ter bugs corrigidos em versões novas | Feature flags controlam features por versão mínima |
+| **Dependência crítica de Payment Gateway externo** | Payment Gateway Adapter | Se gateway indisponível >10min, receita bloqueada | Circuit breaker + alertas SOC, mas sem fallback alternativo |
+| **Legados CloudFoundry com SLA 95%** | Legacy Systems Integration Hub | Indisponibilidade esperada 5% do tempo | Cache defensivo 24h + enfileiramento SQS, mas eventual consistency |
+| **Custo de observabilidade (AppDynamics + Datadog)** | Observability Layer | ~$800/mês por microserviço (AppDynamics ~$600 + Datadog ~$200) | Sampling rate otimizado (10% traces), revisão trimestral de custo-benefício |
+| **Versionamento de schema local (mobile)** | Local Storage Layer | Migração de dados offline complexa se schema mudar muito entre versões | Suporta apenas N-2 versões (máx 2 versões anteriores) |
+
+---
+
+## 8.2. Próximos Passos (Pós-MVP)
+
+### Fase 2 (Meses 7-12): Otimizações e Expansão
+
+**Objetivos:**
+- Otimizar custos operacionais
+- Adicionar features de retenção de usuários
+- Expandir integrações com transportadoras
+
+**Iniciativas:**
+
+**1. Migração de Polling para Webhooks (Transportadoras Privadas)**
+- **Motivação:** Reduzir latência de rastreamento de 1-5min para <5s
+- **Esforço:** 2 sprints (por transportadora)
+- **Dependências:** Transportadoras privadas habilitarem webhooks
+- **ROI:** Redução de 80% em custos de polling + UX superior
+
+**2. CDN para Assets Estáticos (CloudFront)**
+- **Motivação:** Reduzir latência de download de etiquetas PDF para clientes fora de us-east-1
+- **Esforço:** 1 sprint
+- **Dependências:** Nenhuma
+- **ROI:** Latência de download reduzida de 500ms para <100ms (global)
+
+**3. Notificações In-App (além de Push)**
+- **Motivação:** Clientes com push notifications desabilitadas ainda recebem atualizações
+- **Esforço:** 2 sprints
+- **Dependências:** Nenhuma
+- **ROI:** Aumento de 15% em engajamento (estimado)
+
+**4. Adicionar 2-3 Novas Transportadoras**
+- **Motivação:** Aumentar opções de frete, cobertura geográfica
+- **Esforço:** 2 sprints por transportadora (Carrier Integration Layer abstrai complexidade)
+- **Dependências:** Contratos comerciais com transportadoras
+- **ROI:** Aumento de 10-20% em conversão de compra de etiquetas
+
+**5. Otimização de Custos AWS**
+- **Ações:**
+  - Reserved Instances para RDS (economia 30-40%)
+  - Savings Plans para ECS Fargate (economia 30%)
+  - S3 Lifecycle policies (mover backups >90 dias para Glacier - economia 70%)
+- **Esforço:** 1 sprint
+- **ROI:** Redução de $3K/mês → $2K/mês em infraestrutura
+
+---
+
+### Fase 3 (Ano 2): Escalabilidade e Inteligência
+
+**Objetivos:**
+- Suportar 100K MAU e 500K transações/mês
+- Adicionar features de ML/AI
+- Expandir para novos mercados (LATAM)
+
+**Iniciativas:**
+
+**1. Migração para Aurora PostgreSQL**
+- **Motivação:** Write throughput virando gargalo em picos (>5K writes/s)
+- **Esforço:** 4 sprints (migração + validação)
+- **Dependências:** Budget aprovado (custo 2-3x RDS)
+- **ROI:** Suporta 10x write throughput, multi-master (se necessário)
+
+**2. Recomendação Inteligente de Transportadora (ML)**
+- **Features:**
+  - Predição de prazo de entrega real (vs. prometido por transportadora)
+  - Recomendação personalizada (histórico do cliente, reputação transportadora)
+- **Esforço:** 6 sprints (data pipeline, modelo ML, integração)
+- **Dependências:** Time de Data Science
+- **ROI:** Aumento de 20% em satisfação do cliente (NPS)
+
+**3. Expansão LATAM (Multi-Region)**
+- **Motivação:** Atender clientes em Argentina, Chile, Colômbia com baixa latência
+- **Ações:**
+  - Deploy em sa-east-1 (São Paulo) como região secundária
+  - Route 53 geolocation routing
+  - Replicação cross-region de catálogo de agências
+- **Esforço:** 8 sprints
+- **ROI:** Market expansion, redução de latência de 300ms para <100ms (LATAM)
+
+**4. Chat de Suporte In-App (Zendesk ou Intercom)**
+- **Motivação:** Reduzir volume de tickets ServiceNow, melhorar CSAT
+- **Esforço:** 3 sprints
+- **Dependências:** Contrato com Zendesk/Intercom
+- **ROI:** Redução de 30% em tickets L1, CSAT +15%
+
+---
+
+### Fase 4 (Ano 3+): Plataforma e Ecossistema
+
+**Objetivos:**
+- Abrir APIs para parceiros (white-label)
+- Monetização adicional via marketplace
+- Arquitetura 100% cloud-native (deprecar legados)
+
+**Iniciativas:**
+
+**1. API Pública para Parceiros (White-Label)**
+- **Motivação:** Permitir e-commerces integrarem etiquetas diretamente em checkout
+- **Features:**
+  - API REST pública (/v1/partners/quotes, /v1/partners/labels)
+  - Rate limiting per-partner, billing por API call
+  - Developer portal (documentação, sandbox)
+- **Esforço:** 12 sprints
+- **ROI:** Nova fonte de receita (R$ 0.50 por etiqueta via API)
+
+**2. Marketplace de Serviços Logísticos**
+- **Motivação:** Conectar clientes com serviços complementares (embalagem, seguro, armazenamento)
+- **Esforço:** 16 sprints (marketplace + integrações)
+- **ROI:** Comissão de 10-15% sobre serviços de terceiros
+
+**3. Migração Completa de Legados CloudFoundry**
+- **Ações:**
+  - Replicar funcionalidades de sistemas legados em microserviços modernos
+  - Pattern Strangler Fig: migração gradual, validação paralela
+  - Deprecação de Legacy Systems Integration Hub
+- **Esforço:** 24 sprints (2 anos)
+- **ROI:** Redução de custo de CloudFoundry (R$ 5K/mês), eliminação de SLA 95% (upgrade para 99.9%)
+
+**4. Event Sourcing Completo (CQRS)**
+- **Motivação:** Auditoria total, replay de eventos, analytics avançado
+- **Esforço:** 20 sprints
+- **Dependências:** Expertise em Event Sourcing, DDD
+- **ROI:** Compliance facilitado, analytics em tempo real, debugging simplificado
+
+---
+
+## 8.3. Estratégia de Evolução Tecnológica
+
+### Critérios de Decisão para Upgrades
+
+**Quando atualizar tecnologias:**
+1. **Vulnerabilidades críticas (CVEs):** Imediato (hotfix)
+2. **End-of-life (EOL) de versão:** 6 meses antes de EOL (planejado)
+3. **Features novos que resolvem pain points:** Avaliado trimestralmente
+4. **Compliance regulatório:** Imediato se mandatório
+
+**Exemplo:**
+- Java 17 EOL em Set/2029 → Planejar upgrade para Java 21 LTS em Mar/2029
+- Spring Boot 3.2 → 3.3 (virtual threads): Avaliar em Q3/2026 se cold start for pain point
+
+### Política de Deprecação
+
+**APIs:**
+- Versão N suportada: indefinidamente (até deprecation announced)
+- Deprecation period: 6 meses (headers `X-API-Warn: Deprecated, sunset 2027-01-01`)
+- Sunset: Versão retorna `410 Gone` após sunset date
+
+**Mobile App:**
+- Versões suportadas: N (current) + N-1 + N-2 (3 versões simultâneas)
+- Force update: Apenas para vulnerabilidades críticas de segurança
+- Gentle nudges: "Nova versão disponível" após N-2
+
+---
+
+## 8.4. Marcos de Transição para BAU
+
+| Marco | Data Target | Critério de Aceitação | Responsável |
+|-------|-------------|------------------------|-------------|
+| **M1: HLD/LLD Aprovados** | Mês 1 | Aprovação Design Forum, documentação completa em Confluence | Arquiteto Sênior |
+| **M2: INC01 em Produção** | Mês 3 | MVP mobile app em App Store/Play Store, 100 beta users, SLA 99% atingido | Tech Lead |
+| **M3: INC02 em Produção** | Mês 5 | Compra de etiquetas funcional, 500 transações processadas, PCI-DSS SAQ-A completo | Tech Lead + Security Lead |
+| **M4: INC03 em Produção** | Mês 7 | Rastreamento e notificações push funcionais, latência <5s p95 | Tech Lead |
+| **M5: INC04 em Produção** | Mês 9 | Busca de agências e suporte funcionais, 1K tickets resolvidos | Tech Lead |
+| **M6: First Game Day Executado** | Mês 10 | Failover cross-region validado, RTO 1h atingido, lessons learned documentadas | SRE Lead |
+| **M7: Transição BAU Completa** | Mês 12 | Modelo RACI estabelecido, runbooks validados, treinamento executado (8h), consultoria em standby | Arquiteto + SRE Lead |
+| **M8: Otimizações Pós-MVP** | Mês 18 | CDN deployed, 2 transportadoras adicionadas, custos AWS otimizados -30% | Tech Lead |
+
+---
+
+# 9. Conformidade e Governança
+
+## 9.1. Requisitos Regulatórios
+
+### LGPD (Lei Geral de Proteção de Dados - Brasil)
+
+**Escopo:** Todos os dados pessoais de clientes brasileiros (nome, endereço, email, celular, CPF)
+
+**Controles Implementados:**
+- ✅ **Base legal:** Consentimento explícito (opt-in) registrado em Consent Management Service
+- ✅ **Histórico imutável:** DynamoDB append-only log de consentimentos
+- ✅ **Direito de acesso:** API GET /v1/profiles/export retorna JSON completo de dados pessoais
+- ✅ **Direito de retificação:** API PATCH /v1/profiles permite atualização de dados
+- ✅ **Direito ao esquecimento:** API DELETE /v1/profiles soft-delete + anonimização (replace PII with hash)
+- ✅ **Direito de portabilidade:** Export JSON estruturado
+- ✅ **Princípio da minimização:** Coleta apenas dados necessários para operação (nome, endereço, email, celular)
+- ✅ **DPO designado:** Data Protection Officer corporativo (contato: dpo@empresa.com.br)
+- ✅ **RIPD (Relatório de Impacto):** Elaborado e aprovado por DPO antes de INC01
+
+**Evidências de Compliance:**
+- Logs de auditoria (CloudTrail, AppDynamics) com 7 anos de retention (S3 archive)
+- Histórico de consentimentos (DynamoDB, retention indefinida)
+- Documentação de processos (Confluence)
+
+**Próximos Passos:**
+- Auditoria externa LGPD (Ano 2, após 1 ano de operação)
+- Treinamento anual de equipe em LGPD (mandatório)
+
+---
+
+### GDPR (General Data Protection Regulation - União Europeia)
+
+**Escopo:** Dados pessoais de clientes em países da UE (se houver market expansion)
+
+**Controles Implementados:**
+- ✅ **Mesmos controles de LGPD** (GDPR é superset de LGPD)
+- ✅ **Data residency:** Dados podem ser replicados para eu-west-1 (Frankfurt) se expansão EU ocorrer
+- ✅ **Privacy by design:** Criptografia end-to-end, minimização de dados, soft-delete
+- ✅ **DPIA (Data Protection Impact Assessment):** Equivalente a RIPD brasileiro
+
+**Observação:** GDPR não é aplicável no MVP (clientes apenas Brasil/LATAM), mas arquitetura já suporta compliance.
+
+---
+
+### PCI-DSS Level 1 (Payment Card Industry Data Security Standard)
+
+**Escopo:** Processamento de pagamentos com cartão de crédito (>6M transações/ano)
+
+**Controles Implementados:**
+- ✅ **SAQ-A (Self-Assessment Questionnaire A):** Escopo reduzido via tokenização
+- ✅ **Tokenização client-side:** Mobile app tokeniza cartão via SDK de Payment Gateway, PAN nunca trafega no backend
+- ✅ **Isolamento de Payment Gateway Adapter:** Microserviço dedicado, logs sanitizados (apenas últimos 4 dígitos)
+- ✅ **Criptografia TLS 1.3:** Todas as comunicações mobile ↔ backend
+- ✅ **Criptografia AES-256 em repouso:** RDS, S3, ElastiCache
+- ✅ **Rotação trimestral de API keys:** Payment Gateway API keys via Secrets Manager
+- ✅ **Logs de auditoria:** CloudTrail (todas API calls), retention 7 anos
+- ✅ **Vulnerability scanning:** Wiz scan semanal de containers, DAST mensal (OWASP ZAP)
+- ✅ **PEN testing semestral:** QSA externo certificado
+
+**Auditoria:**
+- QSA (Qualified Security Assessor) externo anual
+- ROC (Report on Compliance) entregue para adquirente (gateway de pagamento)
+
+**Próximos Passos:**
+- Primeira auditoria PCI-DSS (Mês 6 pós-lançamento INC02)
+- Revisão semestral de SAQ-A
+
+---
+
+### WCAG 2.1 Level AA (Web Content Accessibility Guidelines)
+
+**Escopo:** Mobile app (Android/iOS)
+
+**Controles Implementados:**
+- ✅ **Suporte a leitores de tela:** TalkBack (Android), VoiceOver (iOS)
+- ✅ **Contraste de cores:** Mínimo 4.5:1 (texto normal), 3:1 (texto grande)
+- ✅ **Tamanhos de toque:** Mínimo 44x44 pontos (iOS), 48x48 dp (Android)
+- ✅ **Navegação por teclado:** Foco visível, ordem lógica de tabulação
+- ✅ **Textos alternativos:** Todas as imagens têm alt text
+- ✅ **Labels semânticos:** Campos de formulário com labels acessíveis
+- ✅ **Feedback sonoro:** Confirmações de ações (compra de etiqueta, etc.)
+
+**Validação:**
+- Testes automatizados: Accessibility Scanner (Android), Accessibility Inspector (iOS)
+- Testes manuais: Usuários com deficiência visual (beta testers)
+- Auditoria externa WCAG 2.1 (Ano 2, certificação opcional)
+
+---
+
+### ABNT NBR 17060 (Acessibilidade Digital - Brasil)
+
+**Escopo:** Mobile app (Android/iOS)
+
+**Controles Implementados:**
+- ✅ **Superset de WCAG 2.1** (NBR 17060 alinha com WCAG + requisitos brasileiros)
+- ✅ **Documentação em português:** Labels, mensagens de erro, ajuda
+- ✅ **Suporte a Libras (futuro):** Vídeos em Libras para tutoriais (roadmap Fase 3)
+
+---
+
+## 9.2. Estrutura de Governança
+
+### Fóruns de Decisão
+
+**1. SteerCo (Steering Committee)**
+- **Frequência:** Mensal (última sexta, 10h-11h BRT)
+- **Participantes:** VP Engineering, VP Product, Arquiteto Sênior, Tech Lead, Product Manager
+- **Objetivo:** Decisões estratégicas (roadmap, budget, alocação de recursos)
+- **Deliverables:** Ata com decisions log, action items (Jira), OKRs progress
+
+**2. Design Forum**
+- **Frequência:** Quinzenal (quintas, 14h-15h BRT)
+- **Participantes:** Arquitetos corporativos, Tech Leads de produto, Security Lead
+- **Objetivo:** Validação de decisões técnicas (ADRs), design reviews (HLD/LLD)
+- **Deliverables:** ADRs aprovados, design documents versionados (Confluence)
+
+**3. Release Board**
+- **Frequência:** Semanal pré-release (terças, 9h BRT)
+- **Participantes:** Release Manager, Tech Lead, QA Lead, SOC Representative
+- **Objetivo:** Aprovação de releases para produção (go/no-go decision)
+- **Deliverables:** Go/No-Go decision, release notes, comunicação de downtime (se aplicável)
+
+---
+
+## 9.3. Rastreabilidade
+
+### Jira Workflow
+
+```
+Epic (INC01, INC02, etc.)
+  ├─ Story (Feature - ex: "Implementar Shipping Orchestrator")
+  │  ├─ Task (Implementation - ex: "Setup Saga State Machine")
+  │  ├─ Task (Testing - ex: "Testes de integração Saga")
+  │  └─ Bug (se detectado em QA)
+  ├─ Story (...)
+  └─ Release (Tag: v1.2.0)
+```
+
+**Linkage Obrigatório:**
+- Story → Epic (Jira link)
+- PR (GitHub) → Story (via commit message: `[INC02-123] Implement payment adapter`)
+- Commit → Story (automático via Jira Smart Commits)
+- Release → Stories (Release Notes automáticas via script Python)
+
+**Exemplo:**
+```
+Epic: INC02 - Compra de Etiqueta
+  ├─ Story: INC02-100 - Implementar Shipping Orchestrator
+  │  ├─ Task: INC02-101 - Setup Saga State Machine (Step Functions)
+  │  ├─ Task: INC02-102 - Implementar Quote Aggregator
+  │  └─ PR #234: [INC02-100] Shipping Orchestrator Saga
+  │     └─ Commit abc123: feat(shipping): Add Saga coordinator
+  ├─ Story: INC02-110 - Implementar Payment Gateway Adapter
+  │  └─ PR #235: [INC02-110] Payment tokenization
+  └─ Release: v1.2.0 (tag: v1.2.0, date: 2026-06-15)
+     └─ Release Notes: "INC02 Stories: INC02-100, INC02-110, INC02-115"
+```
+
+---
+
+## 9.4. Documentação Corporativa
+
+### Templates Mandatórios
+
+**HLD (High Level Design):**
+- **Localização:** Confluence Space: "Postal Services Platform"
+- **Versionamento:** Confluence versões mantidas (histórico completo)
+- **Aprovação:** Arquiteto Sênior + Design Forum (quorum 2/3)
+- **Template:** [Link Confluence Template HLD]
+
+**LLD (Low Level Design):**
+- **Localização:** Confluence Space: "Postal Services Platform / Components"
+- **Versionamento:** Confluence versões mantidas
+- **Aprovação:** Tech Lead
+- **Template:** [Link Confluence Template LLD]
+
+**DR Plans (Disaster Recovery):**
+- **Localização:** Confluence Space: "Postal Services Platform / Operations"
+- **Versionamento:** Confluence versões mantidas
+- **Aprovação:** Arquiteto + SRE Lead
+- **Template:** [Link Confluence Template DR Plan]
+
+**Runbooks:**
+- **Localização:** Confluence Space: "Postal Services Platform / Runbooks"
+- **Versionamento:** Confluence + GitHub (backup markdown)
+- **Aprovação:** SRE Lead
+- **Template:** [Link Confluence Template Runbook]
+
+**Especificações de Interface:**
+- **APIs REST:** OpenAPI 3.0 (versionado em GitHub `/docs/openapi/`)
+- **Eventos:** AsyncAPI 2.6 (versionado em GitHub `/docs/asyncapi/`)
+- **Localização Web:** Swagger UI hospedado em staging/production (ex: https://api-staging.postal.com/docs)
+
+---
+
+# Anexos
+
+## A. Glossário
+
+| Termo | Definição | Contexto |
+|-------|-----------|----------|
+| **ADR** | Architecture Decision Record - Documento que captura decisão arquitetural importante | Governança |
+| **AP (CAP Theorem)** | Availability + Partition Tolerance - Sistema prioriza disponibilidade sobre consistência | Arquitetura |
+| **APM** | Application Performance Monitoring - Observabilidade de performance de aplicações | Observabilidade |
+| **BAU** | Business as Usual - Operação regular pós-implementação | Governança |
+| **Circuit Breaker** | Pattern de resiliência que previne cascata de falhas | Arquitetura |
+| **CQRS** | Command Query Responsibility Segregation - Separação entre leitura e escrita | Arquitetura |
+| **DLQ** | Dead Letter Queue - Fila para mensagens que falharam após retries | Messaging |
+| **DR** | Disaster Recovery - Recuperação de desastres | Operações |
+| **Event Sourcing** | Pattern de persistência via log imutável de eventos | Arquitetura |
+| **HLD** | High Level Design - Documentação arquitetural de alto nível | Governança |
+| **IaC** | Infrastructure as Code - Provisionamento de infraestrutura via código | DevOps |
+| **Idempotência** | Propriedade de operação que produz mesmo resultado se executada múltiplas vezes | Arquitetura |
+| **LLD** | Low Level Design - Documentação técnica detalhada de componente | Governança |
+| **MDR** | Merchant Discount Rate - Taxa cobrada por gateway de pagamento | Negócio |
+| **MVP** | Minimum Viable Product - Produto mínimo viável | Negócio |
+| **NFR** | Non-Functional Requirement - Requisito não funcional | Arquitetura |
+| **PAN** | Primary Account Number - Número do cartão de crédito | Segurança |
+| **PCI-DSS** | Payment Card Industry Data Security Standard - Padrão de segurança para pagamentos | Compliance |
+| **RPO** | Recovery Point Objective - Perda de dados aceitável em DR | Operações |
+| **RTO** | Recovery Time Objective - Tempo de recuperação aceitável em DR | Operações |
+| **Saga** | Pattern para transações distribuídas com compensação | Arquitetura |
+| **SAQ-A** | Self-Assessment Questionnaire A - Formulário PCI-DSS para escopo reduzido | Compliance |
+| **SLA** | Service Level Agreement - Acordo de nível de serviço | Operações |
+| **SLI** | Service Level Indicator - Métrica de qualidade de serviço | Observabilidade |
+| **SLO** | Service Level Objective - Objetivo de qualidade de serviço | Observabilidade |
+| **SOC** | Security Operations Center - Centro de operações de segurança | Segurança |
+| **TTL** | Time To Live - Tempo de vida de cache | Infraestrutura |
+| **WCAG** | Web Content Accessibility Guidelines - Diretrizes de acessibilidade web | Compliance |
+
+---
+
+## B. Referências
+
+### Arquitetura e Design
+- C4 Model: https://c4model.com/
+- ADR Template: https://github.com/joelparkerhenderson/architecture-decision-record
+- Microservices Patterns (Chris Richardson): https://microservices.io/patterns/
+- Domain-Driven Design (Eric Evans): Blue Book
+- Building Microservices (Sam Newman): O'Reilly
+
+### Cloud AWS
+- AWS Well-Architected Framework: https://aws.amazon.com/architecture/well-architected/
+- AWS RDS Best Practices: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_BestPractices.html
+- AWS Step Functions Developer Guide: https://docs.aws.amazon.com/step-functions/
+- AWS Kinesis Best Practices: https://docs.aws.amazon.com/streams/latest/dev/key-concepts.html
+
+### Compliance e Segurança
+- LGPD - Lei 13.709/2018: http://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm
+- GDPR: https://gdpr.eu/
+- PCI-DSS v4.0: https://www.pcisecuritystandards.org/
+- WCAG 2.1: https://www.w3.org/TR/WCAG21/
+- ABNT NBR 17060: https://www.abnt.org.br/
+
+### Observabilidade
+- AppDynamics Documentation: https://docs.appdynamics.com/
+- AWS CloudWatch User Guide: https://docs.aws.amazon.com/AmazonCloudWatch/
+- Datadog Documentation: https://docs.datadoghq.com/
+- OpenTelemetry: https://opentelemetry.io/
+
+### Mobile Development
+- Swift Documentation: https://swift.org/documentation/
+- Kotlin Documentation: https://kotlinlang.org/docs/
+- iOS Human Interface Guidelines: https://developer.apple.com/design/human-interface-guidelines/
+- Android Design Guidelines: https://developer.android.com/design
+
+---
+
+## C. Matriz RACI (Transição BAU)
+
+| Atividade | Responsible | Accountable | Consulted | Informed |
+|-----------|-------------|-------------|-----------|----------|
+| **Incidentes P1 (críticos - downtime total)** | SRE On-Call | SRE Lead | Arquiteto, Tech Lead, SOC | VP Engineering, SteerCo |
+| **Incidentes P2 (degradação parcial)** | Dev On-Call | Tech Lead | SRE, Arquiteto | VP Engineering |
+| **Incidentes P3 (minor issues)** | Dev On-Call | Tech Lead | SRE | - |
+| **Mudanças de Infraestrutura (Terraform)** | SRE | Arquiteto | Tech Lead, Security Lead | SteerCo (se budget impacto) |
+| **Releases (deploy produção)** | Release Manager | Tech Lead | QA, SRE, Security | SteerCo, VP Engineering |
+| **ADRs (decisões arquiteturais)** | Arquiteto | Design Forum | Tech Leads, Security, DBA | SteerCo |
+| **Rotação de Secrets (Payment Gateway, Carriers)** | Security Engineer | Security Lead | SRE, Tech Lead | SOC |
+| **Game Days (DR simulations)** | SRE Lead | Arquiteto | Todos os times técnicos | SteerCo, VP Engineering |
+| **Code Reviews (Pull Requests)** | Dev (autor PR) | Tech Lead (reviewer) | Pares (reviewers) | - |
+| **Testes E2E (pré-release)** | QA Lead | Tech Lead | Dev, SRE | Release Manager |
+| **Monitoramento e Alertas (CloudWatch/AppDynamics)** | SRE | SRE Lead | Arquiteto, Dev On-Call | - |
+| **Otimização de Custos AWS** | SRE | Arquiteto | Tech Lead, Finance | VP Engineering, SteerCo |
+| **Onboarding de Novos Devs** | Tech Lead | VP Engineering | Arquiteto, Senior Devs | HR |
+| **Treinamento Técnico (workshops, docs)** | Arquiteto | VP Engineering | Tech Leads, SRE Lead | Todos os devs |
+| **Auditoria de Compliance (LGPD, PCI-DSS)** | Security Lead | DPO (Data Protection Officer) | Arquiteto, Tech Lead, Legal | SteerCo, VP Engineering |
+
+**Legenda:**
+- **R (Responsible):** Executa a atividade
+- **A (Accountable):** Aprovador final, único responsável (apenas 1 por atividade)
+- **C (Consulted):** Consultado antes da decisão (two-way communication)
+- **I (Informed):** Informado após decisão (one-way communication)
+
+---
+
+**Fim da Documentação Arquitetural**
+
+**Versão:** 1.0  
+**Data:** 05/02/2026  
+**Autores:** Claude Sonnet 4.5 (Geração Automatizada)  
+**Aprovação:** Pendente Design Forum  
+**Próxima Revisão:** Trimestral (pós-release de cada incremento)

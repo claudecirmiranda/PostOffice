@@ -450,13 +450,10 @@ INC04 (US02) depende sequencialmente de INC01 (US01), pois edição de dados pre
 
 ---
 
-## Metadados
+## Controle de Versão
 
-**Documentos Originais Gerados por:**
-- User Stories: ChatGPT Agile Requirements Specialist (gpt-4o) - 2024-06-03
-- Backlog Structure: ChatGPT Agile Backlog Specialist (gpt-4o) - 2024-06-03
-- Increments Planning: Claude Sonnet 4.5 - 2026-02-05
+| Versão | Data | Autor | Mudanças |
+|--------|------|-------|----------|
+| 1.0 | 05/02/2026 | Claudecir Miranda | Versão inicial |
 
-**Documento Markdown Consolidado:**
-- Gerado por: Claude Sonnet 4.5
-- Data: 2026-02-06
+---
